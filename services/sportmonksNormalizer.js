@@ -19,6 +19,7 @@
 
 const { toISTTime, formatMatchDate } = require("../utils/timeUtils");
 const { normalizeIPLTeam, getIPLLogo } = require("../constants/iplTeams");
+const { getLeagueBySmId } = require("../config/leaguesConfig");
 
 // ── Status mapping ────────────────────────────────────────────
 
@@ -148,10 +149,16 @@ function normalizeFixture(raw) {
       raw.visitorteam_id,
     );
 
-    const status     = fixtureStatus(raw);
+    let   status     = fixtureStatus(raw);
     const statusText = raw.note
       ? _cleanNote(raw.note)
       : (status === "upcoming" ? `Match starts at ${_formatMatchTime(raw.starting_at)}` : "");
+
+    // Sportsmonks status field lags behind the note text.
+    // If the note already says "won by / tied / no result / abandoned", treat as completed immediately.
+    if (status === "live" && statusText && /won by|won the match|\btied\b|no result|abandoned|cancelled|called off/i.test(statusText)) {
+      status = "completed";
+    }
     const venue      = raw.venue?.name || "";
     const date       = raw.starting_at || null;
 
@@ -173,6 +180,43 @@ function normalizeFixture(raw) {
       winner = "No Result";
     }
 
+    const leagueInfo  = getLeagueBySmId(raw.season_id);
+    const seriesLabel = leagueInfo
+      ? `${leagueInfo.name} ${leagueInfo.season}`
+      : "Indian Premier League 2026";
+
+    // ── Live batting (active batsmen at crease) ──────────────
+    const batsmen = Array.isArray(raw.batting)
+      ? raw.batting
+          .filter(b => (b.active == 1 || b.active === true) && _playerName(b.player))
+          .slice(0, 2)
+          .map((b, i) => ({
+            name:     _shortName(_playerName(b.player) || ''),
+            runs:     b.score    ?? 0,
+            balls:    b.ball     ?? 0,
+            fours:    b.four_x   ?? 0,
+            sixes:    b.six_x    ?? 0,
+            sr:       b.rate != null ? Number(b.rate).toFixed(1) : '–',
+            isStrike: i === 0,
+          }))
+      : [];
+
+    // ── Live bowling (most recent 2 bowlers) ─────────────────
+    const bowlers = Array.isArray(raw.bowling)
+      ? raw.bowling
+          .filter(b => b.overs > 0 && _playerName(b.player))
+          .slice(-2)
+          .reverse()
+          .map(b => ({
+            name:    _shortName(_playerName(b.player) || ''),
+            overs:   b.overs    ?? 0,
+            wickets: b.wickets  ?? 0,
+            runs:    b.runs     ?? 0,
+            eco:     b.rate != null ? Number(b.rate).toFixed(1) : '–',
+            active:  (b.overs % 1) > 0,
+          }))
+      : [];
+
     return {
       id:          raw.id,
       team1,
@@ -184,7 +228,7 @@ function normalizeFixture(raw) {
       status,
       statusText,
       venue,
-      series:      "Indian Premier League 2026",
+      series:      seriesLabel,
       seriesId:    String(raw.season_id || ""),
       date,
       time:        date ? toISTTime(date) : "",
@@ -193,11 +237,29 @@ function normalizeFixture(raw) {
       matchStage:  descToStage(raw.round),
       toss,
       winner,
+      batsmen,
+      bowlers,
+      isAbandoned: /no result|abandoned|cancelled|called off/i.test(statusText),
     };
   } catch (e) {
     console.warn("[SMNorm] normalizeFixture failed:", raw.id, e.message);
     return null;
   }
+}
+
+function _playerName(player) {
+  if (!player) return null;
+  return player.fullname
+    || (player.firstname && player.lastname ? `${player.firstname} ${player.lastname}` : null)
+    || player.firstname
+    || player.lastname
+    || null;
+}
+
+function _shortName(full) {
+  const parts = (full || '').trim().split(/\s+/);
+  if (parts.length <= 1) return full || '';
+  return parts[0][0] + '. ' + parts[parts.length - 1];
 }
 
 // ── normalizeScorecard ────────────────────────────────────────

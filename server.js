@@ -5,10 +5,13 @@ const express = require("express");
 const cors    = require("cors");
 
 const matchRoutes      = require("./routes/matchRoutes");
+const adminRoutes      = require("./routes/adminRoutes");
+const publicContentRoutes = require("./routes/publicContentRoutes");
 const seriesRoutes     = require("./routes/seriesRoutes");
 const playerRoutes     = require("./routes/playerRoutes");
 const userRoutes       = require("./routes/userRoutes");
 const iplRoutes        = require("./routes/iplRoutes");
+const leagueRoutes     = require("./routes/leagueRoutes");
 const tipsRoutes       = require("./routes/tipsRoutes");
 const homeRoutes       = require("./routes/homeRoutes");
 const predictionRoutes = require("./routes/predictionRoutes");
@@ -34,8 +37,11 @@ app.use((req, _res, next) => {
 
 // ── Routes ────────────────────────────────────────────────────
 
+app.use("/api", adminRoutes);
+app.use("/api", publicContentRoutes);
 app.use("/api", homeRoutes);
 app.use("/api", predictionRoutes);
+app.use("/api", leagueRoutes);
 app.use("/api", iplRoutes);
 app.use("/api", tipsRoutes);
 app.use("/api", matchRoutes);

@@ -49,10 +49,15 @@ const KEYS = {
   USER_PROFILE:     (uid) => `user:profile:${uid}`,
   USER_FAVORITES:   (uid) => `user:favorites:${uid}`,
 
-  // IPL
+  // IPL (legacy keys — kept for iplService backward compat)
   IPL_SERIES_ID:  "ipl:series_id",
   IPL_FIXTURES:   "ipl:fixtures",
   IPL_TABLE:      "ipl:table",
+
+  // Multi-league (keyed by slug)
+  LEAGUE_FIXTURES: (slug) => `league:fixtures:${slug}`,
+  LEAGUE_TABLE:    (slug) => `league:table:${slug}`,
+  LEAGUE_LIVE:     (slug) => `league:live:${slug}`,
 };
 
 // ── Cache instance ────────────────────────────────────────────

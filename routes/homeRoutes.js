@@ -86,8 +86,11 @@ router.get("/home/rankings", async (_req, res) => {
     }
 
     const result = { batsmen, bowlers, teams };
-    await setCachedData(DB_RANKINGS_KEY, result);
-    setCache(DB_RANKINGS_KEY, result, RANKINGS_TTL_S);
+    // Only cache if we have actual data — don't freeze empty results for 6h
+    if (batsmen.length > 0 || bowlers.length > 0 || teams.length > 0) {
+      await setCachedData(DB_RANKINGS_KEY, result);
+      setCache(DB_RANKINGS_KEY, result, RANKINGS_TTL_S);
+    }
     return res.json(result);
   } catch (e) {
     console.error("[Home] rankings error:", e.message);
@@ -152,14 +155,35 @@ router.get("/home/news/:id", async (req, res) => {
 router.get("/img/news/:imageId", async (req, res) => {
   const { imageId } = req.params;
   if (!/^\d+$/.test(imageId)) return res.status(400).end();
+
+  // Serve from memory cache if available (avoids repeat Cricbuzz API calls)
+  const cacheKey = `img:news:${imageId}`;
+  const cached = getCache(cacheKey);
+  if (cached) {
+    res.set("Content-Type", "image/jpeg");
+    res.set("Cache-Control", "public, max-age=86400");
+    return res.send(cached);
+  }
+
   try {
-    const response = await axios.get(
-      `https://cricbuzz-cricket.p.rapidapi.com/img/v1/i1/c${imageId}/i.jpg`,
-      { headers: cricbuzzHeaders(), responseType: "stream", timeout: 10_000 },
-    );
+    // Try i2 (medium) first, fall back to i1 (small thumbnail)
+    let response;
+    try {
+      response = await axios.get(
+        `https://cricbuzz-cricket.p.rapidapi.com/img/v1/i2/c${imageId}/i.jpg`,
+        { headers: cricbuzzHeaders(), responseType: "arraybuffer", timeout: 8_000 },
+      );
+    } catch {
+      response = await axios.get(
+        `https://cricbuzz-cricket.p.rapidapi.com/img/v1/i1/c${imageId}/i.jpg`,
+        { headers: cricbuzzHeaders(), responseType: "arraybuffer", timeout: 8_000 },
+      );
+    }
+    const buf = Buffer.from(response.data);
+    setCache(cacheKey, buf, 24 * 60 * 60);
     res.set("Content-Type", response.headers["content-type"] || "image/jpeg");
     res.set("Cache-Control", "public, max-age=86400");
-    response.data.pipe(res);
+    return res.send(buf);
   } catch {
     res.status(404).end();
   }

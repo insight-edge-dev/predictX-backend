@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Large data files
+data/ipl/ipl.csv
+
 # Environment variables
 .env
 .env.local

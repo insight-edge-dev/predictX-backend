@@ -1,7 +1,7 @@
 {
   "name": "cricketiq-backend",
   "version": "1.0.0",
-  "description": "CricketIQ Node.js backend",
+  "description": "Cricvora Node.js backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

@@ -1,5 +1,5 @@
 /**
- * predictionService.js — CricketIQ pre-match score predictions.
+ * predictionService.js — Cricvora pre-match score predictions.
  *
  * Algorithm (priority order):
  *   1. Historical vs-opponent average (ipl_player_vs_team) — if ≥20 balls faced

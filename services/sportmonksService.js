@@ -91,7 +91,7 @@ async function getFixtureDetail(fixtureId) {
  */
 async function getLivescores() {
   return _fetch("/livescores", {
-    include: "localteam,visitorteam,runs",
+    include: "localteam,visitorteam,runs,batting,bowling",
   });
 }
 
@@ -140,6 +140,79 @@ async function getTeamRankings() {
   return _fetch("/team-rankings", { include: "team" });
 }
 
+// ── All-leagues discovery ─────────────────────────────────────
+
+/**
+ * All leagues available in the subscription.
+ * Returns array of { id, name, code, image_path, country }.
+ * Season data is fetched separately via getRecentSeasons().
+ */
+async function getAllLeagues() {
+  return _fetch("/leagues", {
+    include:  "country",
+    per_page: 100,
+  });
+}
+
+/**
+ * Recent seasons — sorted by id descending (newest first).
+ * Used to find the current season for any league.
+ */
+async function getRecentSeasons() {
+  return _fetch("/seasons", {
+    sort:     "-id",
+    per_page: 500,
+  });
+}
+
+/**
+ * Seasons for a specific league, newest first.
+ * Reliable fallback when batch seasons don't include a league.
+ */
+async function getSeasonForLeague(leagueId) {
+  const data = await _fetch("/seasons", {
+    "filter[league_id]": leagueId,
+    sort:                "-id",
+    per_page:            5,
+  });
+  return Array.isArray(data) ? data[0] ?? null : null;
+}
+
+/**
+ * All stages for a season (needed to find regular-season stage_id).
+ */
+async function getSeasonStages(seasonId) {
+  return _fetch("/stages", {
+    "filter[season_id]": seasonId,
+    per_page: 50,
+  });
+}
+
+// ── Generic league queries ────────────────────────────────────
+
+/**
+ * All fixtures for any Sportsmonks season.
+ * Used by leagueService for multi-league support.
+ */
+async function getFixturesBySeasonId(seasonId) {
+  return _fetch("/fixtures", {
+    "filter[season_id]": seasonId,
+    include: "localteam,visitorteam,runs",
+    per_page: 100,
+  });
+}
+
+/**
+ * Standings for any stage (regular + optional playoff).
+ */
+async function getStandingsByStageIds(stageId, playoffId) {
+  const [regular, playoff] = await Promise.all([
+    _fetch(`/standings/stage/${stageId}`,   { include: "team" }),
+    playoffId ? _fetch(`/standings/stage/${playoffId}`, { include: "team" }) : Promise.resolve([]),
+  ]);
+  return { regular: regular ?? [], playoff: playoff ?? [] };
+}
+
 // ── Exports ───────────────────────────────────────────────────
 
 module.exports = {
@@ -147,10 +220,16 @@ module.exports = {
   IPL_SEASON_ID,
   IPL_STAGE_ID,
   getIPLFixtures,
+  getFixturesBySeasonId,
+  getStandingsByStageIds,
   getFixtureDetail,
   getLivescores,
   getTeamSquad,
   getIPLStandings,
+  getAllLeagues,
+  getRecentSeasons,
+  getSeasonForLeague,
+  getSeasonStages,
   getPlayer,
   searchPlayers,
   getPlayersList,
