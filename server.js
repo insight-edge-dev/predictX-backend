@@ -16,6 +16,7 @@ const tipsRoutes       = require("./routes/tipsRoutes");
 const homeRoutes       = require("./routes/homeRoutes");
 const predictionRoutes = require("./routes/predictionRoutes");
 const smsRoutes        = require("./routes/smsRoutes");
+const authRoutes       = require("./routes/authRoutes");
 
 const { getStats, flushCache }    = require("./services/cacheService");
 const { resetIPLCache, getIPLFixtures } = require("./services/iplService");
@@ -39,6 +40,7 @@ app.use((req, _res, next) => {
 // ── Routes ────────────────────────────────────────────────────
 
 app.use("/api", smsRoutes);
+app.use("/api", authRoutes);
 app.use("/api", adminRoutes);
 app.use("/api", publicContentRoutes);
 app.use("/api", homeRoutes);

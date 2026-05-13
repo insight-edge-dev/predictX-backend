@@ -1,37 +1,21 @@
-/**
- * authMiddleware.js — verify Supabase JWT and attach req.user.
- *
- * Usage (route-level):
- *   router.get("/profile", requireAuth, userController.getProfile);
- *
- * On success: req.user = { id, email, ... }
- * On failure: 401 JSON response
- */
-
-const supabase = require("../config/supabase");
+const jwt = require("jsonwebtoken");
 
 async function requireAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Bearer ")) {
     return res.status(401).json({ error: "Missing or malformed Authorization header" });
   }
 
-  const token = authHeader.slice(7); // strip "Bearer "
-
+  const token = header.slice(7);
   try {
-    const { data, error } = await supabase.auth.getUser(token);
-
-    if (error || !data.user) {
-      console.warn("[Auth] invalid token:", error?.message);
-      return res.status(401).json({ error: "Invalid or expired token" });
-    }
-
-    req.user = data.user;
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = { id: payload.sub, phone: payload.phone };
     return next();
   } catch (e) {
-    console.error("[Auth] unexpected error:", e.message);
-    return res.status(500).json({ error: "Authentication error" });
+    if (e.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token expired", code: "TOKEN_EXPIRED" });
+    }
+    return res.status(401).json({ error: "Invalid token" });
   }
 }
 
