@@ -311,6 +311,7 @@ function normalizeScorecard(fixture) {
       return {
         id:          String(b.player_id),
         name,
+        imageUrl:    b.batsman?.image_path ?? null,
         runs:        b.score     ?? 0,
         balls:       b.ball      ?? 0,
         fours:       b.four_x    ?? 0,
@@ -325,13 +326,14 @@ function normalizeScorecard(fixture) {
 
     // ── Bowling ───────────────────────────────────────
     const bowlers = slotBowl.map(bw => ({
-      id:      String(bw.player_id),
-      name:    playerMap[bw.player_id] || `Player ${bw.player_id}`,
-      overs:   bw.overs   ?? 0,
-      maidens: bw.medians ?? 0,
-      runs:    bw.runs    ?? 0,
-      wickets: bw.wickets ?? 0,
-      economy: bw.rate    ?? 0,
+      id:       String(bw.player_id),
+      name:     playerMap[bw.player_id] || `Player ${bw.player_id}`,
+      imageUrl: bw.bowler?.image_path ?? null,
+      overs:    bw.overs   ?? 0,
+      maidens:  bw.medians ?? 0,
+      runs:     bw.runs    ?? 0,
+      wickets:  bw.wickets ?? 0,
+      economy:  bw.rate    ?? 0,
     }));
 
     // ── Extras ────────────────────────────────────────
