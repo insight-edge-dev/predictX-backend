@@ -188,6 +188,20 @@ async function getSeasonStages(seasonId) {
   });
 }
 
+// ── Season player stats (from fixtures) ──────────────────────
+
+/**
+ * All fixtures for a season with batting + bowling player data included.
+ * Used to aggregate Orange Cap / Purple Cap / Six Hitters leaderboards.
+ */
+async function getSeasonFixturesWithStats(seasonId = IPL_SEASON_ID) {
+  return _fetch("/fixtures", {
+    "filter[season_id]": seasonId,
+    include: "localteam,visitorteam,batting.batsman,bowling.bowler",
+    per_page: 100,
+  });
+}
+
 // ── Generic league queries ────────────────────────────────────
 
 /**
@@ -234,4 +248,5 @@ module.exports = {
   searchPlayers,
   getPlayersList,
   getTeamRankings,
+  getSeasonFixturesWithStats,
 };
