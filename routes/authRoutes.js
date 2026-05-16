@@ -28,6 +28,10 @@ const ACCESS_TOKEN_TTL   = "15m";
 const REFRESH_TOKEN_DAYS = 90;
 const SMS_URL            = "https://jskbulkmarketing.in/app/smsapi/index.php";
 
+// ── Demo account (for Google Play reviewer) ───────────────────
+const DEMO_PHONE = "+910000000001";
+const DEMO_OTP   = "123456";
+
 // ── Helpers ───────────────────────────────────────────────────
 
 function normalizePhone(raw) {
@@ -95,7 +99,7 @@ router.post("/auth/send-otp", async (req, res) => {
       .eq("phone", phone)
       .single();
 
-    if (existing) {
+    if (existing && phone !== DEMO_PHONE) {
       const windowAge = Date.now() - new Date(existing.window_start).getTime();
       if (windowAge < OTP_WINDOW_MS && existing.send_count >= OTP_MAX_SENDS) {
         const retryAfter = Math.ceil((OTP_WINDOW_MS - windowAge) / 1000);
@@ -106,9 +110,14 @@ router.post("/auth/send-otp", async (req, res) => {
       }
     }
 
-    const otp     = generateOtp();
+    // Demo account — fixed OTP, no SMS
+    const isDemo = phone === DEMO_PHONE;
+    const otp     = isDemo ? DEMO_OTP : generateOtp();
     const hash    = await bcrypt.hash(otp, 10);
-    const expires = new Date(Date.now() + OTP_EXPIRY_MS).toISOString();
+    // Demo OTP never expires (100 year expiry)
+    const expires = isDemo
+      ? new Date(Date.now() + 100 * 365 * 86400_000).toISOString()
+      : new Date(Date.now() + OTP_EXPIRY_MS).toISOString();
     const windowReset = !existing || (Date.now() - new Date(existing.window_start).getTime()) >= OTP_WINDOW_MS;
 
     await supabase.from("otp_requests").upsert({
@@ -121,8 +130,8 @@ router.post("/auth/send-otp", async (req, res) => {
       created_at:   new Date().toISOString(),
     }, { onConflict: "phone" });
 
-    await sendSms(phone, otp);
-    console.log(`[Auth] OTP sent to ${phone}`);
+    if (!isDemo) await sendSms(phone, otp);
+    console.log(`[Auth] OTP ${isDemo ? "(demo)" : "sent"} to ${phone}`);
     return res.json({ success: true, message: "OTP sent" });
   } catch (e) {
     console.error("[Auth] send-otp error:", e.message);
