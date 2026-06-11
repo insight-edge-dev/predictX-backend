@@ -203,6 +203,8 @@ function recentFormScore(seasons, n = 3) {
 async function buildPrediction(t1, t2, venue) {
   const currentYear = new Date().getFullYear();
 
+  console.log(`[Tips] buildPrediction: t1="${t1}" t2="${t2}" venue="${venue}"`);
+
   const [
     h2h, venueOverall, t1VenueRow, t2VenueRow,
     t1Seasons, t2Seasons,
@@ -220,6 +222,8 @@ async function buildPrediction(t1, t2, venue) {
     getTeamBowling(t1),
     getTeamBowling(t2),
   ]);
+
+  console.log(`[Tips] data — h2h=${!!h2h} t1Seasons=${t1Seasons.length} t2Seasons=${t2Seasons.length} t1Bat=${t1BatRows.length} t2Bat=${t2BatRows.length}`);
 
   // ── 1. Team Rating (current season win%) ─────────────────────
   const t1CurRow = t1Seasons.find(r => r.season === currentYear);
