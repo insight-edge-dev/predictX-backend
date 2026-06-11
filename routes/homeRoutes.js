@@ -11,7 +11,6 @@
 const express  = require("express");
 const axios    = require("axios");
 const sm       = require("../services/sportmonksService");
-const { normalizeRankings } = require("../services/sportmonksNormalizer");
 const { fetchCricketNews }  = require("../services/newsService");
 const { getCache, setCache } = require("../services/cacheService");
 const { getCachedData, setCachedData } = require("../services/dbService");
@@ -19,9 +18,9 @@ const { getCachedData, setCachedData } = require("../services/dbService");
 const router = express.Router();
 
 const CRICBUZZ_HOST = "cricbuzz-cricket.p.rapidapi.com";
-const RANKINGS_TTL_S  = 6 * 60 * 60;
+const RANKINGS_TTL_S  = 48 * 60 * 60;      // 48h — preserve Cricbuzz quota
 const RANKINGS_TTL_MS = RANKINGS_TTL_S * 1000;
-const DB_RANKINGS_KEY = "home:rankings";
+const DB_RANKINGS_KEY = "home:rankings:v4"; // v4: Cricbuzz team rankings
 
 function cricbuzzHeaders() {
   return {
@@ -50,46 +49,79 @@ router.get("/home/rankings", async (_req, res) => {
       return res.json(dbHit);
     }
 
-    // 3. Sportsmonks — team rankings
-    const raw  = await sm.getTeamRankings();
-    const { teams } = normalizeRankings(raw ?? []);
+    // 3. Cricbuzz — team + player rankings (one API call set, cached 48h)
+    let batsmen = [], bowlers = [], t20Teams = [], odiTeams = [], testTeams = [];
 
-    // 4. Cricbuzz — individual player rankings (batsmen/bowlers)
-    let batsmen = [], bowlers = [];
     if (process.env.CRICBUZZ_API_KEY) {
-      try {
-        const [batsRes, bowlRes] = await Promise.all([
-          axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/batsmen`, {
-            headers: cricbuzzHeaders(), params: { formatType: "t20" }, timeout: 8000,
-          }),
-          axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/bowlers`, {
-            headers: cricbuzzHeaders(), params: { formatType: "t20" }, timeout: 8000,
-          }),
-        ]);
-        batsmen = (batsRes.data?.rank ?? []).slice(0, 10).map(r => ({
-          id: String(r.id), rank: Number(r.rank), name: r.name,
-          country: r.country, rating: Number(r.rating), points: Number(r.points),
-          trend: r.trend || "Flat",
+      const calls = [
+        axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/batsmen`,  { headers: cricbuzzHeaders(), params: { formatType: "t20"  }, timeout: 10000 }),
+        axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/bowlers`,  { headers: cricbuzzHeaders(), params: { formatType: "t20"  }, timeout: 10000 }),
+        axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/teams`,    { headers: cricbuzzHeaders(), params: { formatType: "t20"  }, timeout: 10000 }),
+        axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/teams`,    { headers: cricbuzzHeaders(), params: { formatType: "odi"  }, timeout: 10000 }),
+        axios.get(`https://${CRICBUZZ_HOST}/stats/v1/rankings/teams`,    { headers: cricbuzzHeaders(), params: { formatType: "test" }, timeout: 10000 }),
+      ];
+
+      const results = await Promise.allSettled(calls);
+
+      function mapPlayer(r) {
+        return {
+          id:      String(r.id),
+          rank:    Number(r.rank),
+          name:    r.name,
+          country: r.country,
+          rating:  Number(r.rating),
+          points:  Number(r.points),
+          trend:   r.trend || "Flat",
           imageUrl: r.faceImageId
             ? `https://cricbuzz-static.s3.amazonaws.com/media/img/oneline/${r.faceImageId}.jpg`
             : null,
-        }));
-        bowlers = (bowlRes.data?.rank ?? []).slice(0, 10).map(r => ({
-          id: String(r.id), rank: Number(r.rank), name: r.name,
-          country: r.country, rating: Number(r.rating), points: Number(r.points),
-          trend: r.trend || "Flat",
-          imageUrl: r.faceImageId
-            ? `https://cricbuzz-static.s3.amazonaws.com/media/img/oneline/${r.faceImageId}.jpg`
-            : null,
-        }));
-      } catch { /* Cricbuzz unavailable — proceed without player rankings */ }
+        };
+      }
+
+      function mapTeam(r, idx) {
+        return {
+          id:      String(r.id || idx),
+          rank:    Number(r.rank || idx + 1),
+          name:    r.name || "",
+          code:    r.teamId || "",
+          image:   r.imageId ? `https://cricbuzz-static.s3.amazonaws.com/img/team/${r.imageId}.jpg` : "",
+          rating:  Number(r.rating || 0),
+          matches: 0,
+          points:  Number(r.points || 0),
+        };
+      }
+
+      if (results[0].status === "fulfilled") batsmen  = (results[0].value.data?.rank ?? []).slice(0,10).map(mapPlayer);
+      if (results[1].status === "fulfilled") bowlers   = (results[1].value.data?.rank ?? []).slice(0,10).map(mapPlayer);
+      if (results[2].status === "fulfilled") t20Teams  = (results[2].value.data?.rank ?? []).slice(0,16).map(mapTeam);
+      if (results[3].status === "fulfilled") odiTeams  = (results[3].value.data?.rank ?? []).slice(0,16).map(mapTeam);
+      if (results[4].status === "fulfilled") testTeams = (results[4].value.data?.rank ?? []).slice(0,16).map(mapTeam);
+
+      const failed = results.filter(r => r.status === "rejected").length;
+      console.log(`[Rankings] Cricbuzz: ${results.length - failed}/${results.length} succeeded. T20 teams: ${t20Teams.length}, batsmen: ${batsmen.length}`);
     }
 
-    const result = { batsmen, bowlers, teams };
-    // Only cache if we have actual data — don't freeze empty results for 6h
-    if (batsmen.length > 0 || bowlers.length > 0 || teams.length > 0) {
+    const result = {
+      batsmen,
+      bowlers,
+      teams: t20Teams, // backwards compat for legacy home widget
+      rankings: {
+        t20i_men:   t20Teams,
+        odi_men:    odiTeams,
+        test_men:   testTeams,
+        t20i_women: [],
+        odi_women:  [],
+      },
+    };
+
+    // Cache for 48h IF we got any data — preserve Cricbuzz quota
+    const hasData = batsmen.length > 0 || t20Teams.length > 0;
+    if (hasData) {
       await setCachedData(DB_RANKINGS_KEY, result);
       setCache(DB_RANKINGS_KEY, result, RANKINGS_TTL_S);
+      console.log("[Rankings] cached for 48h");
+    } else {
+      console.warn("[Rankings] no data returned — not caching (will retry next request)");
     }
     return res.json(result);
   } catch (e) {

@@ -17,8 +17,16 @@
  */
 
 const supabase      = require("../config/supabase");
-const { LEAGUES, getLeague } = require("../config/leaguesConfig");
-const leagueService = require("../services/leagueService");
+const { LEAGUES, FOOTBALL_LEAGUES, getLeague } = require("../config/leaguesConfig");
+const leagueService       = require("../services/leagueService");
+const footballService     = require("../services/footballService");
+const intlService         = require("../services/internationalService");
+const adminDashboardService = require("../services/adminDashboardService");
+
+// Virtual league entries that don't live in leaguesConfig (no Sportsmonks IDs)
+const VIRTUAL_LEAGUES = [
+  { slug: "t20i", name: "Twenty20 International", short: "T20I", flag: "🌍" },
+];
 
 // ── Notifications ─────────────────────────────────────────────
 
@@ -65,7 +73,7 @@ async function deleteNotification(req, res) {
 // ── Expert Predictions ────────────────────────────────────────
 
 async function createExpertPrediction(req, res) {
-  const { match_id, match_label, predicted_winner, confidence, analysis, is_published } = req.body;
+  const { match_id, match_label, league_id, predicted_winner, confidence, analysis, is_published } = req.body;
   if (!predicted_winner?.trim() || !analysis?.trim()) {
     return res.status(400).json({ error: "predicted_winner and analysis are required" });
   }
@@ -75,6 +83,7 @@ async function createExpertPrediction(req, res) {
     .insert({
       match_id:        match_id        ?? null,
       match_label:     match_label     ?? null,
+      league_id:       league_id       ?? null,
       predicted_winner: predicted_winner.trim(),
       confidence:      confidence      ?? "MEDIUM",
       analysis:        analysis.trim(),
@@ -90,13 +99,14 @@ async function createExpertPrediction(req, res) {
 
 async function updateExpertPrediction(req, res) {
   const { id } = req.params;
-  const { match_id, match_label, predicted_winner, confidence, analysis, is_published } = req.body;
+  const { match_id, match_label, league_id, predicted_winner, confidence, analysis, is_published } = req.body;
 
   const updates = {
     updated_at: new Date().toISOString(),
   };
   if (match_id         !== undefined) updates.match_id         = match_id;
   if (match_label      !== undefined) updates.match_label      = match_label;
+  if (league_id        !== undefined) updates.league_id        = league_id;
   if (predicted_winner !== undefined) updates.predicted_winner = predicted_winner.trim();
   if (confidence       !== undefined) updates.confidence       = confidence;
   if (analysis         !== undefined) updates.analysis         = analysis.trim();
@@ -136,30 +146,91 @@ async function listExpertPredictionsAdmin(req, res) {
 async function getUpcomingMatchesPicker(req, res) {
   const { league: leagueSlug } = req.query;
 
-  // Return league list if no slug provided
+  // Return full league list when no slug provided
   if (!leagueSlug) {
-    const leagues = Object.values(LEAGUES).map(l => ({
-      slug:  l.slug,
-      name:  l.name,
-      short: l.short,
-      flag:  l.flag,
-    }));
+    const cricketLeagues  = Object.values(LEAGUES).map(l => ({ slug: l.slug, name: l.name, short: l.short, flag: l.flag }));
+    const footballLeagues = Object.values(FOOTBALL_LEAGUES).map(l => ({ slug: l.slug, name: l.name, short: l.short, flag: l.flag }));
+    const leagues = [...cricketLeagues, ...footballLeagues, ...VIRTUAL_LEAGUES];
     return res.json({ leagues, matches: [] });
   }
 
-  const league = getLeague(leagueSlug);
-  if (!league) return res.status(400).json({ error: "Unknown league slug" });
+  const fmtDate = (d) => d ? new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "";
 
   try {
+    // ── Football leagues (wc2026, etc.) ──
+    if (FOOTBALL_LEAGUES[leagueSlug]) {
+      const { live, upcoming } = await footballService.getMatches();
+      const list = [...live, ...upcoming].map(m => {
+        const h = m.homeTeam?.shortName || m.homeTeam?.tla || m.homeTeam?.name || "TBA";
+        const a = m.awayTeam?.shortName || m.awayTeam?.tla || m.awayTeam?.name || "TBA";
+        return { id: String(m.id), label: `${h} vs ${a} (${fmtDate(m.date)})`, date: m.date ?? "" };
+      });
+      list.sort((a, b) => new Date(a.date) - new Date(b.date));
+      return res.json({ matches: list });
+    }
+
+    // ── International T20I ──
+    if (leagueSlug === "t20i") {
+      const bucket   = intlService.INTERNATIONAL_LEAGUES.t20i;
+      const fixtures = await intlService.getBucketFixtures(bucket);
+      const list = fixtures
+        .filter(m => {
+          const st = m.status;
+          const startedInPast = m.date && (Date.now() - new Date(m.date).getTime()) > 4 * 60 * 60 * 1000;
+          return st !== "completed" && !startedInPast;
+        })
+        .map(m => {
+          const t1 = m.team1?.shortName || m.team1?.name || "TBA";
+          const t2 = m.team2?.shortName || m.team2?.name || "TBA";
+          const series = m.stageName ? ` · ${m.stageName.replace(/ tour of .+/, " tour")}` : "";
+          return { id: String(m.id), label: `${t1} vs ${t2}${series} (${fmtDate(m.date)})`, date: m.date ?? "" };
+        });
+      list.sort((a, b) => new Date(a.date) - new Date(b.date));
+      return res.json({ matches: list });
+    }
+
+    // ── Cricket leagues (ipl, bbl, psl, etc.) ──
+    const league = getLeague(leagueSlug);
+    if (!league) return res.status(400).json({ error: "Unknown league slug" });
+
     const { upcoming, live } = await leagueService.getLeagueMatches(league);
     const list = [...live, ...upcoming].map(m => {
       const t1   = m.team1?.shortName || m.team1?.name || "TBA";
       const t2   = m.team2?.shortName || m.team2?.name || "TBA";
-      const date = m.date ? new Date(m.date).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "";
-      return { id: String(m.id), label: `${t1} vs ${t2} (${date})`, date: m.date ?? "" };
+      return { id: String(m.id), label: `${t1} vs ${t2} (${fmtDate(m.date)})`, date: m.date ?? "" };
     });
     list.sort((a, b) => new Date(a.date) - new Date(b.date));
     return res.json({ matches: list });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+// ── Dashboard ──────────────────────────────────────────────────
+
+async function getOverview(req, res) {
+  try {
+    const stats = await adminDashboardService.getOverviewStats();
+    return res.json(stats);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function getMatchMonitor(req, res) {
+  try {
+    const monitor = await adminDashboardService.getMatchMonitor();
+    return res.json(monitor);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function listUsersAdmin(req, res) {
+  try {
+    const { search = "", page = "1", limit = "20" } = req.query;
+    const result = await adminDashboardService.listUsers({ search, page: Number(page) || 1, limit: Number(limit) || 20 });
+    return res.json(result);
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
@@ -174,4 +245,7 @@ module.exports = {
   deleteExpertPrediction,
   listExpertPredictionsAdmin,
   getUpcomingMatchesPicker,
+  getOverview,
+  getMatchMonitor,
+  listUsersAdmin,
 };

@@ -20,6 +20,7 @@ const LEAGUES = {
     flag:      '🏏',
     country:   'India',
     format:    'T20',
+    sport:     'cricket',
   },
   bbl: {
     slug:      'bbl',
@@ -33,6 +34,7 @@ const LEAGUES = {
     flag:      '🦘',
     country:   'Australia',
     format:    'T20',
+    sport:     'cricket',
   },
   psl: {
     slug:      'psl',
@@ -46,6 +48,7 @@ const LEAGUES = {
     flag:      '🟢',
     country:   'Pakistan',
     format:    'T20',
+    sport:     'cricket',
   },
   bpl: {
     slug:      'bpl',
@@ -59,6 +62,7 @@ const LEAGUES = {
     flag:      '🟥',
     country:   'Bangladesh',
     format:    'T20',
+    sport:     'cricket',
   },
   t20blast: {
     slug:      't20blast',
@@ -72,6 +76,7 @@ const LEAGUES = {
     flag:      '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
     country:   'England',
     format:    'T20',
+    sport:     'cricket',
   },
   t20wc: {
     slug:      't20wc',
@@ -85,6 +90,21 @@ const LEAGUES = {
     flag:      '🌍',
     country:   'International',
     format:    'T20',
+    sport:     'cricket',
+  },
+  wwct20: {
+    slug:      'wwct20',
+    name:      "ICC Women's T20 World Cup",
+    short:     'WWCT20',
+    season:    '2026',
+    leagueId:  16,
+    seasonId:  1745,
+    stageId:   null,   // auto-discovered by leagueService.resolveStageId
+    playoffId: null,
+    flag:      '🏏',
+    country:   'World',
+    format:    'T20',
+    sport:     'cricket',
   },
   gsl: {
     slug:      'gsl',
@@ -98,6 +118,7 @@ const LEAGUES = {
     flag:      '🌐',
     country:   'West Indies',
     format:    'T20',
+    sport:     'cricket',
   },
   csa_t20: {
     slug:      'csa_t20',
@@ -111,17 +132,44 @@ const LEAGUES = {
     flag:      '🦁',
     country:   'South Africa',
     format:    'T20',
+    sport:     'cricket',
   },
 };
 
-// Quick lookup by slug
+// ── Football leagues (API-Football IDs) ──────────────────────────
+const FOOTBALL_LEAGUES = {
+  wc2026: {
+    slug:     'wc2026',
+    name:     'FIFA World Cup 2026',
+    short:    'WC 2026',
+    season:   '2026',
+    competitionCode: 'WC',  // football-data.org competition code for FIFA World Cup
+    flag:     '🏆',
+    country:  'USA / Canada / Mexico',
+    format:   '90min',
+    sport:    'football',
+  },
+};
+
+const ALL_LEAGUES = { ...LEAGUES, ...FOOTBALL_LEAGUES };
+
 function getLeague(slug) {
-  return LEAGUES[slug] ?? null;
+  return ALL_LEAGUES[slug] ?? null;
 }
 
-// Quick lookup by Sportsmonks league ID
+// Lookup by Sportsmonks league ID (cricket only)
 function getLeagueBySmId(leagueId) {
   return Object.values(LEAGUES).find(l => l.leagueId === Number(leagueId)) ?? null;
 }
 
-module.exports = { LEAGUES, getLeague, getLeagueBySmId };
+// Lookup by Sportsmonks season ID (cricket only)
+function getLeagueBySeasonId(seasonId) {
+  return Object.values(LEAGUES).find(l => l.seasonId === Number(seasonId)) ?? null;
+}
+
+// Lookup football league by API-Football league ID
+function getFootballLeague(slug) {
+  return FOOTBALL_LEAGUES[slug] ?? null;
+}
+
+module.exports = { LEAGUES, FOOTBALL_LEAGUES, ALL_LEAGUES, getLeague, getLeagueBySmId, getLeagueBySeasonId, getFootballLeague };

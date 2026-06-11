@@ -16,4 +16,8 @@ router.delete("/admin/expert-predictions/:id", adminAuth, ctrl.deleteExpertPredi
 
 router.get("/admin/matches", adminAuth, ctrl.getUpcomingMatchesPicker);
 
+router.get("/admin/overview", adminAuth, ctrl.getOverview);
+router.get("/admin/monitor",  adminAuth, ctrl.getMatchMonitor);
+router.get("/admin/users",    adminAuth, ctrl.listUsersAdmin);
+
 module.exports = router;

@@ -59,6 +59,7 @@ async function getIPLFixtures() {
   console.log(`[IPL ${SEASON}] fixtures ready: ${fixtures.length} matches`);
   setCache(KEYS.IPL_FIXTURES, fixtures, TTL.FIXTURES);
   void db.setCachedData(DB_FIXTURES_KEY, fixtures);
+  void db.syncCricketReferenceData(fixtures);
   return fixtures;
 }
 

@@ -75,6 +75,7 @@ async function getLeagueFixtures(league) {
   console.log(`[League:${league.slug}] fixtures: ${fixtures.length} matches`);
   setCache(memKey, fixtures, TTL.FIXTURES);
   void db.setCachedData(dbKey, fixtures);
+  void db.syncCricketReferenceData(fixtures);
   return fixtures;
 }
 

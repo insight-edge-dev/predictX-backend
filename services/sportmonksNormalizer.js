@@ -19,7 +19,7 @@
 
 const { toISTTime, formatMatchDate } = require("../utils/timeUtils");
 const { normalizeIPLTeam, getIPLLogo } = require("../constants/iplTeams");
-const { getLeagueBySmId } = require("../config/leaguesConfig");
+const { getLeagueBySmId, getLeagueBySeasonId } = require("../config/leaguesConfig");
 
 // ── Status mapping ────────────────────────────────────────────
 
@@ -180,10 +180,11 @@ function normalizeFixture(raw) {
       winner = "No Result";
     }
 
-    const leagueInfo  = getLeagueBySmId(raw.season_id);
+    // Resolve league config: try league_id first (correct), then season_id as fallback
+    const leagueInfo  = getLeagueBySmId(raw.league_id) ?? getLeagueBySeasonId(raw.season_id);
     const seriesLabel = leagueInfo
       ? `${leagueInfo.name} ${leagueInfo.season}`
-      : "Indian Premier League 2026";
+      : (raw.league?.name || raw.season?.name || "International Cricket");
 
     // ── Live batting (active batsmen at crease) ──────────────
     const batsmen = Array.isArray(raw.batting)
@@ -217,6 +218,34 @@ function normalizeFixture(raw) {
           }))
       : [];
 
+    // Man of the match
+    const motm = raw.manofmatch
+      ? {
+          id:    raw.manofmatch.id,
+          name:  raw.manofmatch.fullname || `${raw.manofmatch.firstname || ""} ${raw.manofmatch.lastname || ""}`.trim(),
+          image: raw.manofmatch.image_path || "",
+          role:  _mapPosition(raw.manofmatch.position?.name),
+        }
+      : null;
+
+    // Officials (umpires)
+    const officials = {
+      umpire1:  raw.firstumpire?.fullname  || null,
+      umpire2:  raw.secondumpire?.fullname || null,
+      tvUmpire: raw.tvumpire?.fullname     || null,
+    };
+
+    // Toss (enrich with tosswon include if available)
+    if (!toss && raw.tosswon) {
+      toss = {
+        winner:   raw.tosswon.name || "",
+        decision: raw.elected || "",
+      };
+    }
+
+    // venueId for deep-linking to venue profile
+    const venueId = raw.venue_id ? String(raw.venue_id) : null;
+
     return {
       id:          raw.id,
       team1,
@@ -228,8 +257,15 @@ function normalizeFixture(raw) {
       status,
       statusText,
       venue,
+      venueId,
       series:      seriesLabel,
       seriesId:    String(raw.season_id || ""),
+      // Populated only when the caller requests the `stage` include — used by
+      // internationalService to group bilateral fixtures into named tours
+      // (Sportsmonks tags each fixture's stage with the series name itself,
+      // e.g. "New Zealand tour of India").
+      stageId:     raw.stage?.id ?? null,
+      stageName:   raw.stage?.name ?? null,
       date,
       time:        date ? toISTTime(date) : "",
       matchType:   (raw.type || "t20").toLowerCase(),
@@ -237,6 +273,8 @@ function normalizeFixture(raw) {
       matchStage:  descToStage(raw.round),
       toss,
       winner,
+      manOfMatch:  motm,
+      officials,
       batsmen,
       bowlers,
       isAbandoned: /no result|abandoned|cancelled|called off/i.test(statusText),
@@ -500,9 +538,167 @@ function normalizePlayerProfile(raw) {
   };
 }
 
+// ── normalizeLineup ───────────────────────────────────────────
+// Converts lineup[] include from a fixture into team1XI / team2XI.
+
+function normalizeLineup(lineup, localteamId, visitorteamId) {
+  if (!Array.isArray(lineup) || lineup.length === 0) return { team1XI: [], team2XI: [] };
+
+  const team1XI = [];
+  const team2XI = [];
+
+  for (const p of lineup) {
+    const player = {
+      id:           String(p.id),
+      name:         p.fullname || `${p.firstname || ""} ${p.lastname || ""}`.trim(),
+      role:         _mapPosition(p.position?.name),
+      battingStyle: p.battingstyle  || "",
+      bowlingStyle: p.bowlingstyle  || "",
+      image:        p.image_path    || "",
+    };
+
+    const teamId = p.lineup?.team_id;
+    if (teamId === localteamId)        team1XI.push(player);
+    else if (teamId === visitorteamId) team2XI.push(player);
+  }
+
+  return { team1XI, team2XI };
+}
+
+// ── normalizeBalls ────────────────────────────────────────────
+// Groups raw balls[] delivery list into overs.
+
+function normalizeBalls(rawBalls) {
+  // Handle both flat array and Sportsmonks paginated { data: [] }
+  const list = Array.isArray(rawBalls) ? rawBalls
+    : (Array.isArray(rawBalls?.data) ? rawBalls.data : []);
+  if (list.length === 0) return [];
+
+  // Log first ball shape to help debug field names
+  if (list[0]) {
+    console.log("[normalizeBalls] first ball keys:", Object.keys(list[0]).join(", "));
+  }
+
+  const overMap = new Map();
+
+  list.forEach((b, idx) => {
+    // Determine over number — try all known Sportsmonks field names
+    let overNum;
+    if (b.ball_descriptor != null) {
+      overNum = Math.floor(Number(b.ball_descriptor));
+    } else if (b.over != null && b.over !== 0) {
+      overNum = Number(b.over);
+    } else if (b.over_number != null) {
+      overNum = Number(b.over_number);
+    } else {
+      // Derive from cumulative ball position: balls 1-6 → over 0, 7-12 → over 1, etc.
+      const cumBall = Number(b.ball) || (idx + 1);
+      overNum = Math.floor((cumBall - 1) / 6);
+    }
+    if (isNaN(overNum) || overNum < 0) overNum = 0;
+
+    if (!overMap.has(overNum)) {
+      overMap.set(overNum, { overNumber: overNum, balls: [], overRuns: 0, wickets: 0 });
+    }
+
+    // Normalise runs — try every common field name, force to number
+    const rawRuns = b.runs ?? b.score ?? b.run ?? b.name;
+    const runs    = typeof rawRuns === 'number' ? rawRuns : (parseInt(String(rawRuns), 10) || 0);
+
+    // Booleans — handle both bool and 0/1 int
+    const four     = b.four     === true || b.four     === 1 || b.is_four  === true || b.is_four  === 1;
+    const six      = b.six      === true || b.six      === 1 || b.is_six   === true || b.is_six   === 1;
+    const isWicket = b.is_wicket=== true || b.is_wicket=== 1 || b.wicket  === true || b.wicket   === 1;
+
+    // Commentary string
+    const commentary = typeof b.commentary === 'string' ? b.commentary
+      : (typeof b.note === 'string' ? b.note : "");
+
+    const delivery = { ball: idx + 1, runs, four, six, isWicket, commentary };
+
+    const over = overMap.get(overNum);
+    over.balls.push(delivery);
+    over.overRuns += runs;
+    if (isWicket) over.wickets += 1;
+  });
+
+  return Array.from(overMap.values())
+    .sort((a, b) => a.overNumber - b.overNumber);
+}
+
+// ── normalizeCareerStats ──────────────────────────────────────
+// Converts career include from /players/{id}?include=career.
+// Sportsmonks returns one entry per season the player featured in,
+// each tagged with a format `type` (T20I/ODI/Test/T20/...) and an
+// optional `batting`/`bowling` breakdown for that season. Aggregate
+// those season rows into one career total per format.
+
+function normalizeCareerStats(career) {
+  if (!Array.isArray(career) || career.length === 0) return { batting: [], bowling: [] };
+
+  const battingByType = new Map();
+  const bowlingByType = new Map();
+
+  for (const entry of career) {
+    const type = entry.type || entry.tournament_type || "Other";
+
+    if (entry.batting) {
+      const b   = entry.batting;
+      const acc = battingByType.get(type) ?? { type, matches: 0, innings: 0, runs: 0, balls: 0, notOuts: 0, highScore: 0, hundreds: 0, fifties: 0 };
+      acc.matches  += b.matches            ?? 0;
+      acc.innings  += b.innings            ?? 0;
+      acc.runs     += b.runs_scored        ?? 0;
+      acc.balls    += b.balls_faced        ?? 0;
+      acc.notOuts  += b.not_outs           ?? 0;
+      acc.hundreds += b.hundreds           ?? 0;
+      acc.fifties  += b.fifties            ?? 0;
+      acc.highScore = Math.max(acc.highScore, b.highest_inning_score ?? 0);
+      battingByType.set(type, acc);
+    }
+
+    if (entry.bowling) {
+      const bl  = entry.bowling;
+      const acc = bowlingByType.get(type) ?? { type, matches: 0, innings: 0, wickets: 0, runsConceded: 0, balls: 0 };
+      acc.matches      += bl.matches ?? 0;
+      acc.innings      += bl.innings ?? 0;
+      acc.wickets      += bl.wickets ?? 0;
+      acc.runsConceded += bl.runs    ?? 0;
+      acc.balls        += (bl.overs ?? 0) * 6;
+      bowlingByType.set(type, acc);
+    }
+  }
+
+  const batting = Array.from(battingByType.values()).map(acc => {
+    const dismissals = acc.innings - acc.notOuts;
+    return {
+      type:       acc.type,
+      matches:    acc.matches,
+      innings:    acc.innings,
+      runs:       acc.runs,
+      highScore:  String(acc.highScore),
+      average:    dismissals > 0 ? Math.round((acc.runs / dismissals) * 100) / 100 : 0,
+      strikeRate: acc.balls > 0  ? Math.round((acc.runs / acc.balls) * 10000) / 100 : 0,
+      hundreds:   acc.hundreds,
+      fifties:    acc.fifties,
+    };
+  });
+
+  const bowling = Array.from(bowlingByType.values()).map(acc => ({
+    type:        acc.type,
+    matches:     acc.matches,
+    innings:     acc.innings,
+    wickets:     acc.wickets,
+    average:     acc.wickets > 0 ? Math.round((acc.runsConceded / acc.wickets) * 100) / 100 : 0,
+    economy:     acc.balls > 0   ? Math.round((acc.runsConceded / acc.balls) * 600) / 100   : 0,
+    bestFigures: "0/0",
+  }));
+
+  return { batting, bowling };
+}
+
 // ── normalizeRankings ─────────────────────────────────────────
 // Sportsmonks /team-rankings returns by type (TEST/ODI/T20).
-// We extract the T20 type for home screen.
+// Legacy: extracts T20 type for home screen backwards-compat.
 
 function normalizeRankings(raw) {
   if (!Array.isArray(raw)) return { batsmen: [], bowlers: [], teams: [] };
@@ -524,6 +720,46 @@ function normalizeRankings(raw) {
   return { batsmen: [], bowlers: [], teams };
 }
 
+// ── normalizeRankingFormat ────────────────────────────────────
+// For a single filtered /team-rankings response (one format+gender).
+
+function normalizeRankingFormat(raw) {
+  if (!Array.isArray(raw)) return [];
+
+  // Find the first entry that has a team array
+  for (const entry of raw) {
+    const teamArr = Array.isArray(entry.team) ? entry.team : [];
+    if (teamArr.length > 0) {
+      return teamArr.slice(0, 16).map(t => ({
+        id:      String(t.id),
+        rank:    t.ranking?.position ?? t.position ?? 0,
+        name:    t.name  || "",
+        code:    t.code  || "",
+        image:   t.image_path || "",
+        rating:  t.ranking?.rating  ?? 0,
+        matches: t.ranking?.matches ?? 0,
+        points:  t.ranking?.points  ?? 0,
+      }));
+    }
+  }
+  return [];
+}
+
+// ── normalizeVenue ────────────────────────────────────────────
+
+function normalizeVenue(raw) {
+  if (!raw) return null;
+  return {
+    id:         String(raw.id),
+    name:       raw.name       || "",
+    city:       raw.city       || "",
+    country:    raw.country?.name || raw.country || "",
+    capacity:   raw.capacity   || null,
+    floodlight: raw.floodlight === true || raw.floodlight === 1,
+    image:      raw.image_path || "",
+  };
+}
+
 module.exports = {
   normalizeFixture,
   normalizeScorecard,
@@ -532,4 +768,9 @@ module.exports = {
   normalizePlayerSummary,
   normalizePlayerProfile,
   normalizeRankings,
+  normalizeRankingFormat,
+  normalizeLineup,
+  normalizeBalls,
+  normalizeCareerStats,
+  normalizeVenue,
 };

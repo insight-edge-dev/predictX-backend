@@ -62,6 +62,47 @@ async function _fetch(endpoint, params = {}) {
   }
 }
 
+/**
+ * Like _fetch, but follows `meta.last_page` and concatenates `data` across
+ * pages (capped at maxPages). Needed for generic international buckets —
+ * e.g. a single T20I season can span 100+ fixtures across multiple pages,
+ * unlike single-tournament leagues which always fit in one page.
+ */
+async function _fetchAllPages(endpoint, params = {}, maxPages = 3) {
+  const key = _key();
+  if (!key) {
+    console.warn("[SM] SPORTMONKS_API_KEY not set");
+    return [];
+  }
+  if (Date.now() < _rateLimitUntil) {
+    return [];
+  }
+
+  const results = [];
+  for (let page = 1; page <= maxPages; page++) {
+    try {
+      const { data } = await axios.get(`${BASE}${endpoint}`, {
+        params:  { api_token: key, ...params, page },
+        timeout: TIMEOUT_MS,
+      });
+      const pageData = data?.data;
+      if (Array.isArray(pageData)) results.push(...pageData);
+
+      const lastPage = data?.meta?.last_page ?? 1;
+      if (page >= lastPage) break;
+    } catch (e) {
+      if (e.response?.status === 429) {
+        _rateLimitUntil = Date.now() + 2 * 60_000;
+        console.warn("[SM] 429 — backing off 2 min");
+      } else {
+        console.error(`[SM] ${endpoint} (page ${page}) error:`, e.response?.status ?? e.message);
+      }
+      break;
+    }
+  }
+  return results;
+}
+
 // ── Fixtures ──────────────────────────────────────────────────
 
 /**
@@ -77,21 +118,60 @@ async function getIPLFixtures() {
 }
 
 /**
- * Single fixture with full scorecard detail.
- * Includes batting/bowling with player names, scoreboards, venue.
+ * Single fixture with full scorecard, lineup, officials, man of match.
  */
 async function getFixtureDetail(fixtureId) {
   return _fetch(`/fixtures/${fixtureId}`, {
-    include: "localteam,visitorteam,runs,batting.batsman,bowling.bowler,scoreboards,venue",
+    include: "localteam,visitorteam,runs,batting.batsman,bowling.bowler,scoreboards,venue,lineup,manofmatch,firstumpire,secondumpire,tvumpire,tosswon",
   });
 }
 
 /**
- * Currently live matches (all leagues — we filter for IPL downstream).
+ * All today's fixtures (live + scheduled today) — all leagues.
  */
 async function getLivescores() {
   return _fetch("/livescores", {
     include: "localteam,visitorteam,runs,batting,bowling",
+  });
+}
+
+/**
+ * Fixtures updated in the last 2 hours — efficient incremental polling.
+ * Use instead of full /livescores for WebSocket server-side refresh.
+ */
+async function getFixtureUpdates() {
+  return _fetch("/fixtures/updates", {
+    include: "localteam,visitorteam,runs",
+  });
+}
+
+/**
+ * Ball-by-ball delivery data for a match.
+ * Returns balls[] with over, ball, runs, four, six, is_wicket, commentary.
+ */
+async function getMatchBalls(fixtureId) {
+  return _fetch(`/fixtures/${fixtureId}`, {
+    include: "balls,localteam,visitorteam,runs",
+  });
+}
+
+/**
+ * Single venue profile.
+ */
+async function getVenue(venueId) {
+  return _fetch(`/venues/${venueId}`, { include: "country" });
+}
+
+/**
+ * ICC team rankings filtered by format and gender.
+ * type: 'TEST' | 'ODI' | 'T20I'
+ * gender: 'men' | 'women'
+ */
+async function getTeamRankingsFiltered(type, gender) {
+  return _fetch("/team-rankings", {
+    "filter[tournament_type]": type,
+    "filter[gender]":          gender,
+    include:                   "team",
   });
 }
 
@@ -119,13 +199,14 @@ async function getIPLStandings() {
 // ── Players ───────────────────────────────────────────────────
 
 async function getPlayer(playerId) {
-  return _fetch(`/players/${playerId}`);
+  return _fetch(`/players/${playerId}`, { include: "career" });
 }
 
 async function searchPlayers(query, page = 1) {
   return _fetch("/players", {
     "filter[name]": query,
-    per_page: 25,
+    include:         "country,position",
+    per_page:        25,
     page,
   });
 }
@@ -217,6 +298,48 @@ async function getFixturesBySeasonId(seasonId) {
 }
 
 /**
+ * All fixtures for a generic international bucket league + season
+ * (e.g. "Twenty20 International", id 3) with venue + stage included —
+ * `stage.name` is what carries the bilateral series name (e.g.
+ * "New Zealand tour of India"), used by internationalService to group
+ * fixtures into named tours. Paginated — these buckets span 100+ fixtures.
+ */
+async function getInternationalFixtures(seasonId) {
+  return _fetchAllPages("/fixtures", {
+    "filter[season_id]": seasonId,
+    include:  "localteam,visitorteam,venue,stage,runs",
+    per_page: 100,
+  });
+}
+
+/**
+ * All historical meetings between two teams within one league (both home/away
+ * directions) — used to build an all-time head-to-head record for bilateral
+ * international predictions (no shared league table to lean on there).
+ */
+async function getFixturesBetweenTeams(leagueId, teamAId, teamBId) {
+  const common = { "filter[league_id]": leagueId, include: "localteam,visitorteam", per_page: 50, sort: "-starting_at" };
+  const [ab, ba] = await Promise.all([
+    _fetch("/fixtures", { ...common, "filter[localteam_id]": teamAId, "filter[visitorteam_id]": teamBId }),
+    _fetch("/fixtures", { ...common, "filter[localteam_id]": teamBId, "filter[visitorteam_id]": teamAId }),
+  ]);
+  return [...(Array.isArray(ab) ? ab : []), ...(Array.isArray(ba) ? ba : [])];
+}
+
+/**
+ * A team's most recent fixtures (any opponent) within one league — used to
+ * derive "recent international form" for bilateral predictions.
+ */
+async function getTeamRecentFixtures(leagueId, teamId, perPage = 20) {
+  const common = { "filter[league_id]": leagueId, include: "localteam,visitorteam", per_page: perPage, sort: "-starting_at" };
+  const [asLocal, asVisitor] = await Promise.all([
+    _fetch("/fixtures", { ...common, "filter[localteam_id]": teamId }),
+    _fetch("/fixtures", { ...common, "filter[visitorteam_id]": teamId }),
+  ]);
+  return [...(Array.isArray(asLocal) ? asLocal : []), ...(Array.isArray(asVisitor) ? asVisitor : [])];
+}
+
+/**
  * Standings for any stage (regular + optional playoff).
  */
 async function getStandingsByStageIds(stageId, playoffId) {
@@ -235,9 +358,16 @@ module.exports = {
   IPL_STAGE_ID,
   getIPLFixtures,
   getFixturesBySeasonId,
+  getInternationalFixtures,
+  getFixturesBetweenTeams,
+  getTeamRecentFixtures,
   getStandingsByStageIds,
   getFixtureDetail,
   getLivescores,
+  getFixtureUpdates,
+  getMatchBalls,
+  getVenue,
+  getTeamRankingsFiltered,
   getTeamSquad,
   getIPLStandings,
   getAllLeagues,

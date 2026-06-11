@@ -29,8 +29,8 @@ const REFRESH_TOKEN_DAYS = 90;
 const SMS_URL            = "https://jskbulkmarketing.in/app/smsapi/index.php";
 
 // ── Demo account (for Google Play reviewer) ───────────────────
-const DEMO_PHONE = "+919000000001";
-const DEMO_OTP   = "123456";
+const DEMO_PHONE = process.env.DEMO_PHONE || "+919000000001";
+const DEMO_OTP   = process.env.DEMO_OTP   || "123456";
 
 // ── Helpers ───────────────────────────────────────────────────
 

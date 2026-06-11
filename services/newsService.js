@@ -14,7 +14,7 @@ const { getCache, setCache }           = require("./cacheService");
 const { getCachedData, setCachedData } = require("./dbService");
 
 const BASE    = "https://cricbuzz-cricket.p.rapidapi.com";
-const TTL_S   = 30 * 60;
+const TTL_S   = 6 * 60 * 60;   // 6h — preserve Cricbuzz quota (was 30 min)
 const TTL_MS  = TTL_S * 1000;
 const DB_KEY  = "home:news";
 

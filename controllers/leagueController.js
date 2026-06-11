@@ -11,10 +11,25 @@
  *   GET /leagues/:slug/table
  */
 
-const { LEAGUES, getLeague }  = require("../config/leaguesConfig");
+const { LEAGUES, FOOTBALL_LEAGUES, getLeague } = require("../config/leaguesConfig");
+
+// Football leagues as a flat array ready for the API response
+const FOOTBALL_LEAGUE_LIST = Object.values(FOOTBALL_LEAGUES).map(l => ({
+  slug: l.slug, leagueId: l.leagueId, seasonId: null,
+  stageId: null, playoffId: null,
+  name: l.name, short: l.short, season: l.season,
+  flag: l.flag, country: l.country, format: l.format, image: "",
+  sport: l.sport,
+}));
 const leagueService            = require("../services/leagueService");
 const sm                       = require("../services/sportmonksService");
 const { getCache, setCache, TTL } = require("../services/cacheService");
+
+// Generic international buckets that are NOT real franchise leagues — they
+// contain hundreds of unrelated bilateral tours and are handled separately
+// by the /api/international/* section.  Exclude them from the league picker
+// so users don't accidentally select them and see an empty, unsorted list.
+const INTL_BUCKET_IDS = new Set([3, 258, 261]); // T20I, Women's T20I, Women's ODI
 
 // ── Country → flag emoji ──────────────────────────────────────
 
@@ -73,7 +88,7 @@ async function listLeagues(_req, res) {
       flag: l.flag, country: l.country, format: l.format, image: "",
     }));
     console.warn("[LeagueCtrl] listLeagues: Sportsmonks returned no data — using hardcoded config");
-    return res.json({ leagues: list });
+    return res.json({ leagues: [...list, ...FOOTBALL_LEAGUE_LIST] });
   }
 
   // Build leagueId → most-recent season map from batch response
@@ -132,7 +147,7 @@ async function listLeagues(_req, res) {
         image:     l.image_path  ?? "",
       };
     })
-    .filter(l => l.seasonId)   // only leagues with a resolvable season
+    .filter(l => l.seasonId && !INTL_BUCKET_IDS.has(l.leagueId))  // exclude international buckets
     .sort((a, b) => {
       const aK = !!known.find(k => k.leagueId === a.leagueId);
       const bK = !!known.find(k => k.leagueId === b.leagueId);
@@ -141,9 +156,9 @@ async function listLeagues(_req, res) {
       return a.name.localeCompare(b.name);
     });
 
-  const unique = deduplicateSlugs(leagues);
+  const unique = deduplicateSlugs([...leagues, ...FOOTBALL_LEAGUE_LIST]);
   setCache(MEM_KEY, unique, TTL.DAILY);
-  console.log(`[LeagueCtrl] listLeagues: ${unique.length} leagues total`);
+  console.log(`[LeagueCtrl] listLeagues: ${unique.length} leagues total (incl. football)`);
   res.json({ leagues: unique });
 }
 
@@ -167,18 +182,27 @@ async function resolveLeagueDynamic(slug) {
   if (!raw) return null;
   const known = Object.values(LEAGUES);
   const match = raw.find(l => makeSlug(l.code, l.name, l.id) === slug);
-  if (!match || !match.currentseason?.id) return null;
+  if (!match) return null;
 
+  // getAllLeagues() doesn't include `currentseason` — resolve it the same
+  // reliable way listLeagues() does (batch seasons don't cover every league).
   const knownConf = known.find(k => k.leagueId === match.id);
+  const seasonId  = knownConf?.seasonId ?? null;
+  let   season    = null;
+  if (!seasonId) {
+    season = await sm.getSeasonForLeague(match.id);
+    if (!season?.id) return null;
+  }
+
   return {
     slug,
     leagueId:  match.id,
-    seasonId:  match.currentseason.id,
+    seasonId:  seasonId ?? season.id,
     stageId:   knownConf?.stageId   ?? null,
     playoffId: knownConf?.playoffId ?? null,
     name:      match.name  ?? "",
     short:     match.code  ?? "",
-    season:    String(match.currentseason.year ?? ""),
+    season:    knownConf?.season ?? String(season?.name ?? season?.year ?? ""),
     flag:      knownConf?.flag ?? countryFlag(match.country?.name),
     country:   match.country?.name ?? "",
     format:    "T20",

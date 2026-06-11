@@ -39,6 +39,40 @@
  *     data        jsonb       not null,
  *     updated_at  timestamptz not null default now()
  *   );
+ *
+ *   -- Permanent reference data — upserted whenever the API returns
+ *   -- fresh data (not TTL-expired; rows persist and are kept current).
+ *
+ *   create table if not exists cricket_teams (
+ *     id          text        primary key,
+ *     data        jsonb       not null,
+ *     updated_at  timestamptz not null default now()
+ *   );
+ *
+ *   create table if not exists cricket_venues (
+ *     id          text        primary key,
+ *     data        jsonb       not null,
+ *     updated_at  timestamptz not null default now()
+ *   );
+ *
+ *   create table if not exists football_teams (
+ *     code        text        primary key,
+ *     data        jsonb       not null,
+ *     updated_at  timestamptz not null default now()
+ *   );
+ *
+ *   create table if not exists football_fixtures (
+ *     id          text        primary key,
+ *     status      text        not null,
+ *     data        jsonb       not null,
+ *     updated_at  timestamptz not null default now()
+ *   );
+ *
+ *   create table if not exists football_groups (
+ *     group_name  text        primary key,
+ *     data        jsonb       not null,
+ *     updated_at  timestamptz not null default now()
+ *   );
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -186,6 +220,119 @@ async function deleteFixtures(key) {
   }
 }
 
+// ── Cricket reference data (teams / venues) ──────────────────
+// Permanent rows, upserted whenever fresh fixtures arrive from the API
+// so each team/venue stays current without ever expiring.
+
+async function getCricketTeam(id) {
+  return _fetchOne("cricket_teams", "id", id);
+}
+
+async function saveCricketTeam(id, data) {
+  await _upsert("cricket_teams", { id, data, updated_at: NOW() }, "id");
+}
+
+async function getCricketVenue(id) {
+  return _fetchOne("cricket_venues", "id", id);
+}
+
+async function saveCricketVenue(id, data) {
+  await _upsert("cricket_venues", { id, data, updated_at: NOW() }, "id");
+}
+
+/**
+ * Extracts unique teams and venues from a list of normalized cricket
+ * fixtures (sportmonksNormalizer output: { team1, team2, venue, venueId })
+ * and upserts them. Fire-and-forget — call as `void db.syncCricketReferenceData(fixtures)`.
+ */
+async function syncCricketReferenceData(fixtures) {
+  if (!Array.isArray(fixtures) || fixtures.length === 0) return;
+
+  const teams  = new Map();
+  const venues = new Map();
+
+  for (const f of fixtures) {
+    for (const team of [f.team1, f.team2]) {
+      if (team?.id) teams.set(String(team.id), team);
+    }
+    if (f.venueId) venues.set(f.venueId, { id: f.venueId, name: f.venue || "" });
+  }
+
+  for (const [id, data] of teams)  await saveCricketTeam(id, data);
+  for (const [id, data] of venues) await saveCricketVenue(id, data);
+
+  if (teams.size || venues.size) {
+    console.log(`[DB] cricket reference sync — ${teams.size} teams, ${venues.size} venues`);
+  }
+}
+
+// ── Football reference data (teams / fixtures / groups) ──────
+// Permanent rows, upserted whenever fresh data arrives from the API
+// so the WC schedule and standings stay current without ever expiring.
+
+async function getFootballTeam(code) {
+  return _fetchOne("football_teams", "code", code);
+}
+
+async function saveFootballTeam(code, data) {
+  await _upsert("football_teams", { code, data, updated_at: NOW() }, "code");
+}
+
+async function getFootballFixture(id) {
+  return _fetchOne("football_fixtures", "id", id);
+}
+
+async function saveFootballFixture(id, status, data) {
+  await _upsert("football_fixtures", { id, status, data, updated_at: NOW() }, "id");
+}
+
+async function getFootballGroup(groupName) {
+  return _fetchOne("football_groups", "group_name", groupName);
+}
+
+async function saveFootballGroup(groupName, data) {
+  await _upsert("football_groups", { group_name: groupName, data, updated_at: NOW() }, "group_name");
+}
+
+/**
+ * Upserts every fixture (and the teams it references) from a freshly
+ * fetched WC fixture list. Fire-and-forget — call as `void db.syncFootballFixtures(fixtures)`.
+ */
+async function syncFootballFixtures(fixtures) {
+  if (!Array.isArray(fixtures) || fixtures.length === 0) return;
+
+  const teams = new Map();
+  for (const f of fixtures) {
+    await saveFootballFixture(f.id, f.status, f);
+    for (const team of [f.homeTeam, f.awayTeam]) {
+      if (team?.id) teams.set(team.id, team);
+    }
+  }
+  for (const [id, data] of teams) await saveFootballTeam(id, data);
+
+  console.log(`[DB] football fixture sync — ${fixtures.length} fixtures, ${teams.size} teams`);
+}
+
+/**
+ * Upserts every group's standings (and the teams within them) from a
+ * freshly fetched WC standings response. Fire-and-forget.
+ */
+async function syncFootballGroups(groups) {
+  const entries = Object.entries(groups || {});
+  if (entries.length === 0) return;
+
+  const teams = new Map();
+  for (const [groupName, rows] of entries) {
+    await saveFootballGroup(groupName, rows);
+    for (const row of rows) {
+      if (row.team?.id) teams.set(row.team.id, row.team);
+    }
+  }
+  for (const [id, data] of teams) await saveFootballTeam(id, data);
+
+  console.log(`[DB] football group sync — ${entries.length} groups, ${teams.size} teams`);
+}
+
 // ── Generic keyed cache (uses `series` table) ─────────────────
 // Used for rankings, news, and any other external API data.
 // TTL is enforced server-side by checking `updated_at`.
@@ -272,4 +419,17 @@ module.exports = {
   deleteAllMatches,
   deleteAllSquads,
   deleteCachedByPrefix,
+  getCricketTeam,
+  saveCricketTeam,
+  getCricketVenue,
+  saveCricketVenue,
+  syncCricketReferenceData,
+  getFootballTeam,
+  saveFootballTeam,
+  getFootballFixture,
+  saveFootballFixture,
+  getFootballGroup,
+  saveFootballGroup,
+  syncFootballFixtures,
+  syncFootballGroups,
 };

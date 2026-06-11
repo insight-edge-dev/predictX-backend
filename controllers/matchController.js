@@ -15,6 +15,8 @@ const {
   normalizeFixture,
   normalizeScorecard,
   normalizeSquadPlayers,
+  normalizeLineup,
+  normalizeBalls,
 } = require("../services/sportmonksNormalizer");
 const {
   getIPLMatches,
@@ -325,6 +327,67 @@ async function getMatchStats(req, res) {
   return getMatchFull(req, res);
 }
 
+// ── GET /api/matches/:id/lineup ───────────────────────────────
+
+async function getMatchLineup(req, res) {
+  const { id } = req.params;
+  const cacheKey = `match:lineup:${id}`;
+
+  const mem = getCache(cacheKey);
+  if (mem) return res.json(mem);
+
+  try {
+    const fixture = await sm.getFixtureDetail(id);
+    if (!fixture) return res.json({ team1XI: [], team2XI: [] });
+
+    const lineup = normalizeLineup(
+      fixture.lineup ?? [],
+      fixture.localteam_id,
+      fixture.visitorteam_id,
+    );
+
+    if (lineup.team1XI.length > 0 || lineup.team2XI.length > 0) {
+      setCache(cacheKey, lineup, TTL.DAILY);
+    }
+    return res.json(lineup);
+  } catch (e) {
+    console.error("[Match] lineup error:", e.message);
+    return res.json({ team1XI: [], team2XI: [] });
+  }
+}
+
+// ── GET /api/matches/:id/overs ────────────────────────────────
+
+async function getMatchOvers(req, res) {
+  const { id } = req.params;
+  const cacheKey = `match:overs:${id}`;
+
+  const mem = getCache(cacheKey);
+  if (mem) return res.json(mem);
+
+  try {
+    const fixture = await sm.getMatchBalls(id);
+    if (!fixture) return res.json({ overs: [], currentOver: 0 });
+
+    // Pass fixture.balls raw — normalizeBalls handles both array and paginated {data:[]}
+    const overs = normalizeBalls(fixture.balls);
+    console.log(`[Overs] matchId=${id} fixture.balls type=${Array.isArray(fixture.balls) ? 'array' : typeof fixture.balls} balls=${Array.isArray(fixture.balls) ? fixture.balls.length : 'n/a'} overs=${overs.length}`);
+
+    const result = {
+      overs,
+      currentOver: overs.length > 0 ? overs[overs.length - 1].overNumber : 0,
+    };
+
+    // Live: cache 30s; completed: cache 6h
+    const isLive = fixture.live === true;
+    setCache(cacheKey, result, isLive ? TTL.LIVE : TTL.SERIES);
+    return res.json(result);
+  } catch (e) {
+    console.error("[Match] overs error:", e.message);
+    return res.json({ overs: [], currentOver: 0 });
+  }
+}
+
 module.exports = {
   getMatches,
   getLive,
@@ -336,4 +399,6 @@ module.exports = {
   getMatchScorecard,
   getMatchSeries,
   getMatchStats,
+  getMatchLineup,
+  getMatchOvers,
 };

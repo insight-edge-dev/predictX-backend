@@ -13,6 +13,16 @@
 
 const supabase = require("../config/supabase");
 
+// Playoff fixtures (Qualifier 1/2, Eliminator, Final) are sometimes published
+// before the league-stage results that decide who plays in them — both slots
+// get filled with a "TBC"/"TBD" placeholder team. Predicting that matchup would
+// be meaningless and would persist (predictions are cached ~1 year), so skip —
+// it regenerates naturally once Sportsmonks updates the fixture with real teams.
+function isPlaceholderTeam(team) {
+  const name = (team?.shortName || team?.name || "").toUpperCase();
+  return name === "TBC" || name === "TBD";
+}
+
 // ── Supabase helpers ──────────────────────────────────────────
 
 async function _query(table, filters = {}) {
@@ -471,6 +481,7 @@ async function getMatchTip(match, _squad = null) {
   const t2    = match.team2?.shortName;
   const venue = match.venue || "";
   if (!t1 || !t2) return null;
+  if (isPlaceholderTeam(match.team1) || isPlaceholderTeam(match.team2)) return null;
 
   const [prediction, topPerformers] = await Promise.all([
     buildPrediction(t1, t2, venue),
@@ -489,6 +500,7 @@ async function getLightweightTip(match) {
   const t2    = match.team2?.shortName;
   const venue = match.venue || "";
   if (!t1 || !t2) return null;
+  if (isPlaceholderTeam(match.team1) || isPlaceholderTeam(match.team2)) return null;
   try {
     const p = await buildPrediction(t1, t2, venue);
     return {

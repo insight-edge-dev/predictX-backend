@@ -27,13 +27,24 @@ router.get("/notifications", async (req, res) => {
 
 // ── GET /api/expert-predictions ───────────────────────────────
 // Returns published expert predictions, newest first.
+// Pass ?league=<slug> to scope to one league (e.g. 'ipl', 'wc2026').
+// Predictions with no league_id (legacy/standalone) are treated as
+// league-agnostic and always included.
 
-router.get("/expert-predictions", async (_req, res) => {
-  const { data, error } = await supabase
+router.get("/expert-predictions", async (req, res) => {
+  const { league } = req.query;
+
+  let query = supabase
     .from("expert_predictions")
     .select("*")
     .eq("is_published", true)
     .order("created_at", { ascending: false });
+
+  if (league) {
+    query = query.or(`league_id.eq.${league},league_id.is.null`);
+  }
+
+  const { data, error } = await query;
 
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ predictions: data ?? [] });

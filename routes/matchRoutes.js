@@ -12,6 +12,8 @@ router.get("/matches/:id/full",      controller.getMatchFull);
 router.get("/matches/:id/scorecard", controller.getMatchScorecard);
 router.get("/matches/:id/series",    controller.getMatchSeries);
 router.get("/matches/:id/squad",     controller.getMatchSquad);
+router.get("/matches/:id/lineup",    controller.getMatchLineup);
+router.get("/matches/:id/overs",     controller.getMatchOvers);
 router.get("/matches/:id/stats",     controller.getMatchStats);
 router.get("/matches/:id",           controller.getMatchById);
 
