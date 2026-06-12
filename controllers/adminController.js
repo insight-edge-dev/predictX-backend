@@ -14,6 +14,14 @@
  *
  * Matches helper:
  *   GET    /api/admin/matches                upcoming IPL matches for picker
+ *
+ * Banners:
+ *   POST   /api/admin/banners/upload         upload banner image to Cloudinary
+ *   POST   /api/admin/banners                create
+ *   GET    /api/admin/banners                list all
+ *   PUT    /api/admin/banners/:id            edit
+ *   PUT    /api/admin/banners/reorder        reorder
+ *   DELETE /api/admin/banners/:id            delete
  */
 
 const supabase      = require("../config/supabase");
@@ -22,6 +30,9 @@ const leagueService       = require("../services/leagueService");
 const footballService     = require("../services/footballService");
 const intlService         = require("../services/internationalService");
 const adminDashboardService = require("../services/adminDashboardService");
+const cloudinaryService    = require("../services/cloudinaryService");
+
+const BANNER_LINK_TYPES = ["none", "external", "match", "tip", "league_home", "app_section"];
 
 // Virtual league entries that don't live in leaguesConfig (no Sportsmonks IDs)
 const VIRTUAL_LEAGUES = [
@@ -236,6 +247,149 @@ async function listUsersAdmin(req, res) {
   }
 }
 
+// ── Banners ────────────────────────────────────────────────────
+
+async function uploadBannerImage(req, res) {
+  if (!req.file) return res.status(400).json({ error: "image file is required" });
+  try {
+    const { url, publicId } = await cloudinaryService.uploadImage(req.file.buffer, req.file.mimetype);
+    return res.json({ url, publicId });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function createBanner(req, res) {
+  const {
+    title, image_url, image_public_id,
+    link_type = "none", link_value, link_meta,
+    placements, display_order, is_active,
+  } = req.body;
+
+  if (!title?.trim() || !image_url || !image_public_id) {
+    return res.status(400).json({ error: "title, image_url and image_public_id are required" });
+  }
+  if (!BANNER_LINK_TYPES.includes(link_type)) {
+    return res.status(400).json({ error: `link_type must be one of: ${BANNER_LINK_TYPES.join(", ")}` });
+  }
+  if (!Array.isArray(placements) || placements.length === 0) {
+    return res.status(400).json({ error: "placements must be a non-empty array" });
+  }
+
+  const { data, error } = await supabase
+    .from("banners")
+    .insert({
+      title: title.trim(),
+      image_url,
+      image_public_id,
+      link_type,
+      link_value: link_value ?? null,
+      link_meta: link_meta ?? null,
+      placements,
+      display_order: Number(display_order) || 0,
+      is_active: is_active ?? true,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ banner: data });
+}
+
+async function listBannersAdmin(req, res) {
+  const { data, error } = await supabase
+    .from("banners")
+    .select("*")
+    .order("display_order", { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ banners: data ?? [] });
+}
+
+async function updateBanner(req, res) {
+  const { id } = req.params;
+  const {
+    title, image_url, image_public_id,
+    link_type, link_value, link_meta,
+    placements, display_order, is_active,
+  } = req.body;
+
+  if (link_type && !BANNER_LINK_TYPES.includes(link_type)) {
+    return res.status(400).json({ error: `link_type must be one of: ${BANNER_LINK_TYPES.join(", ")}` });
+  }
+  if (placements !== undefined && (!Array.isArray(placements) || placements.length === 0)) {
+    return res.status(400).json({ error: "placements must be a non-empty array" });
+  }
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("banners")
+    .select("image_public_id")
+    .eq("id", id)
+    .single();
+  if (fetchError) return res.status(404).json({ error: "banner not found" });
+
+  const updates = { updated_at: new Date().toISOString() };
+  if (title          !== undefined) updates.title          = title.trim();
+  if (image_url      !== undefined) updates.image_url      = image_url;
+  if (image_public_id !== undefined) updates.image_public_id = image_public_id;
+  if (link_type      !== undefined) updates.link_type      = link_type;
+  if (link_value     !== undefined) updates.link_value     = link_value ?? null;
+  if (link_meta      !== undefined) updates.link_meta      = link_meta ?? null;
+  if (placements     !== undefined) updates.placements     = placements;
+  if (display_order  !== undefined) updates.display_order  = Number(display_order) || 0;
+  if (is_active      !== undefined) updates.is_active      = is_active;
+
+  const { data, error } = await supabase
+    .from("banners")
+    .update(updates)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // If the image was replaced, clean up the old Cloudinary asset.
+  if (image_public_id && image_public_id !== existing.image_public_id) {
+    await cloudinaryService.deleteImage(existing.image_public_id);
+  }
+
+  return res.json({ banner: data });
+}
+
+async function reorderBanners(req, res) {
+  const { order } = req.body;
+  if (!Array.isArray(order) || order.length === 0) {
+    return res.status(400).json({ error: "order must be a non-empty array of banner ids" });
+  }
+
+  for (let i = 0; i < order.length; i++) {
+    const { error } = await supabase
+      .from("banners")
+      .update({ display_order: i, updated_at: new Date().toISOString() })
+      .eq("id", order[i]);
+    if (error) return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ success: true });
+}
+
+async function deleteBanner(req, res) {
+  const { id } = req.params;
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("banners")
+    .select("image_public_id")
+    .eq("id", id)
+    .single();
+  if (fetchError) return res.status(404).json({ error: "banner not found" });
+
+  const { error } = await supabase.from("banners").delete().eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+
+  await cloudinaryService.deleteImage(existing.image_public_id);
+  return res.json({ success: true });
+}
+
 module.exports = {
   createNotification,
   listNotificationsAdmin,
@@ -248,4 +402,10 @@ module.exports = {
   getOverview,
   getMatchMonitor,
   listUsersAdmin,
+  uploadBannerImage,
+  createBanner,
+  listBannersAdmin,
+  updateBanner,
+  reorderBanners,
+  deleteBanner,
 };

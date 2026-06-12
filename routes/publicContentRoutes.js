@@ -50,4 +50,24 @@ router.get("/expert-predictions", async (req, res) => {
   return res.json({ predictions: data ?? [] });
 });
 
+// ── GET /api/banners ───────────────────────────────────────────
+// Returns active banners for a placement, ordered for display.
+// ?placement=discovery  → banners targeting the Discovery home
+// ?placement=<league>   → banners targeting that league home, plus 'all_leagues'
+
+router.get("/banners", async (req, res) => {
+  const { placement } = req.query;
+  if (!placement) return res.status(400).json({ error: "placement is required" });
+
+  let query = supabase.from("banners").select("*").eq("is_active", true);
+  query = placement === "discovery"
+    ? query.contains("placements", ["discovery"])
+    : query.or(`placements.cs.{${placement}},placements.cs.{all_leagues}`);
+
+  const { data, error } = await query.order("display_order", { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ banners: data ?? [] });
+});
+
 module.exports = router;
