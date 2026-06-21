@@ -31,13 +31,21 @@ function refreshHardcodedFixtures() {
     // IST → UTC: subtract 5h30m
     const utcMs      = Date.UTC(y, mo - 1, d, istH, istM) - (5.5 * 60 * 60 * 1000);
     const elapsed    = now - utcMs;
+    const elapsedMin = Math.floor(elapsed / 60_000);
     const status     = elapsed < 0 ? "upcoming" : elapsed < 105 * 60 * 1000 ? "live" : "completed";
     const isLive     = status === "live";
     const isCompleted = status === "completed";
+    // Same elapsed-time minute estimate as the real-API path (footballNormalizer.estimateMinute) —
+    // no live clock is available here either, since this is purely placeholder data pre-sync.
+    const minute = !isLive ? null
+      : elapsedMin <= 45 ? Math.max(elapsedMin, 1)
+      : elapsedMin <= 60 ? 45
+      : Math.min(45 + (elapsedMin - 60), 90);
     return {
       ...f,
       status,
       statusText: isCompleted ? "FT" : isLive ? "LIVE" : "",
+      minute,
       score: {
         ...f.score,
         home: (isLive || isCompleted) ? (f.score.home ?? 0) : null,
@@ -45,6 +53,61 @@ function refreshHardcodedFixtures() {
       },
     };
   });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const EVENTS_FETCH_DELAY_MS = 7000;  // stay under football-data.org's 10 req/min free-tier cap
+const MAX_EVENTS_FETCH_PER_RUN = 20; // safety cap on a large first-time backfill; remainder catch up next cycle
+
+/**
+ * Goal events only exist on the per-match detail endpoint, not the bulk
+ * fixtures list — fetched and attached separately, one extra API call per
+ * match that needs it.
+ */
+async function fetchMatchEvents(matchId) {
+  try {
+    const detail = await api.getMatchDetail(matchId);
+    return detail?.goals ? norm.normalizeGoals(detail.goals) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Attaches `events` (goal scorers) to live matches (always re-fetched, since
+ * the game is still in progress) and to completed matches that don't have
+ * them cached yet (fetched once, then carried forward forever after).
+ * Throttled and capped per run so a large backfill can't burst past the
+ * free-tier rate limit — any matches left over are picked up next cycle.
+ */
+async function enrichWithEvents(fixtures, previousFixtures) {
+  const previousEvents = new Map(
+    previousFixtures.filter((f) => f.events?.length).map((f) => [f.id, f.events])
+  );
+
+  for (const f of fixtures) {
+    if (f.status === "completed" && previousEvents.has(f.id)) {
+      f.events = previousEvents.get(f.id);
+    }
+  }
+
+  // Live matches always go first — they're the time-sensitive case — so a
+  // big one-time completed-match backfill can never starve them of budget.
+  const needsFetch = [
+    ...fixtures.filter((f) => f.status === "live"),
+    ...fixtures.filter((f) => f.status === "completed" && !previousEvents.has(f.id)),
+  ];
+
+  let fetched = 0;
+  for (const f of needsFetch) {
+    if (fetched >= MAX_EVENTS_FETCH_PER_RUN) break;
+    f.events = await fetchMatchEvents(f.id);
+    fetched++;
+    if (fetched < needsFetch.length) await sleep(EVENTS_FETCH_DELAY_MS);
+  }
+
+  return fetched;
 }
 
 /**
@@ -59,12 +122,16 @@ function refreshHardcodedFixtures() {
  * rate limit no matter how much traffic the app gets.
  */
 async function refreshFromAPI() {
-  const result = { fixtures: 0, groups: 0 };
+  const result = { fixtures: 0, groups: 0, events: 0 };
 
   try {
     const raw = await api.getFixtures();
     const fixtures = raw.map(f => norm.normalizeFixture(f));
+
     if (fixtures.length > 0) {
+      const previousFixtures = getCache(KEYS.FOOTBALL_FIXTURES) ?? [];
+      result.events = await enrichWithEvents(fixtures, previousFixtures);
+
       setCache(KEYS.FOOTBALL_FIXTURES, fixtures, TTL.FOOTBALL_FIXTURES);
       await db.setCachedData(KEYS.FOOTBALL_FIXTURES, fixtures);
       void db.syncFootballFixtures(fixtures);
@@ -91,8 +158,53 @@ async function refreshFromAPI() {
     console.warn("[Football] refreshFromAPI: standings refresh failed —", e.message);
   }
 
-  console.log(`[Football] refreshFromAPI — synced ${result.fixtures} fixtures, ${result.groups} groups`);
+  console.log(`[Football] refreshFromAPI — synced ${result.fixtures} fixtures, ${result.groups} groups, ${result.events} match(es) enriched with goal events`);
   return result;
+}
+
+/**
+ * Lightweight live-score refresh — updates ONLY status/score/minute on
+ * whichever matches are (or were) live, leaving fixtures metadata,
+ * standings, and goal-event backfill untouched. Runs every 60s (see
+ * footballSchedulerService) independent of the heavy 8h refreshFromAPI —
+ * without this, a live match's score/clock would stay frozen at whatever
+ * it was during the last full sync for up to 8 hours.
+ *
+ * NodeCache-only (doesn't touch Supabase) — the 8h refreshFromAPI remains
+ * the sole writer to the DB, so this can't pile up redundant DB writes.
+ */
+async function refreshLiveScores() {
+  const cacheKey = KEYS.FOOTBALL_FIXTURES;
+  const cached = getCache(cacheKey);
+  if (!cached || cached.length === 0 || cached[0]?._hardcoded) return 0;
+
+  try {
+    const raw = await api.getFixtures();
+    const freshById = new Map(raw.map(f => norm.normalizeFixture(f)).map(f => [f.id, f]));
+
+    let updated = 0;
+    const merged = cached.map((f) => {
+      const latest = freshById.get(f.id);
+      if (!latest) return f;
+      const changed =
+        f.status !== latest.status ||
+        f.minute !== latest.minute ||
+        f.score.home !== latest.score.home ||
+        f.score.away !== latest.score.away;
+      if (!changed) return f;
+      updated++;
+      return { ...f, status: latest.status, statusText: latest.statusText, minute: latest.minute, score: latest.score };
+    });
+
+    if (updated > 0) {
+      setCache(cacheKey, merged, TTL.FOOTBALL_FIXTURES);
+      setCache(KEYS.FOOTBALL_LIVE, merged.filter((f) => f.status === "live"), TTL.FOOTBALL_LIVE);
+    }
+    return updated;
+  } catch (e) {
+    console.warn("[Football] refreshLiveScores failed —", e.message);
+    return 0;
+  }
 }
 
 /**
@@ -160,9 +272,9 @@ async function getLiveMatches() {
 
 /**
  * Single match detail — looked up from the synced fixtures list.
- * No dedicated live API call (football-data.org's per-match endpoint added
- * nothing of value — it returns the same fields as the bulk list, plus an
- * always-null `venue` pre-tournament — so it's not worth spending a request on).
+ * No dedicated live API call here (the per-match detail endpoint is only
+ * called from refreshFromAPI's enrichWithEvents, to attach goal events —
+ * everything else it returns duplicates the bulk fixtures list).
  */
 async function getMatchById(matchId) {
   const cacheKey = KEYS.FOOTBALL_MATCH(matchId);
@@ -250,4 +362,5 @@ module.exports = {
   getMatchById,
   getGroups,
   refreshFromAPI,
+  refreshLiveScores,
 };

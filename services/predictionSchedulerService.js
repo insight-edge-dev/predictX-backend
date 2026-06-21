@@ -18,6 +18,7 @@ const { LEAGUES }   = require("../config/leaguesConfig");
 const leagueService = require("./leagueService");
 const genericTips   = require("./genericTipsService");
 const db            = require("./dbService");
+const jobTracker    = require("./jobTracker");
 
 const REFRESH_INTERVAL_MS = 8 * 60 * 60 * 1000; // 24h / 3 = 8h, mirrors footballScheduler
 const BOOT_DELAY_MS       = 30 * 1000;          // let the server finish booting first
@@ -96,8 +97,9 @@ async function runRefresh() {
 function start() {
   if (intervalHandle) return;
 
-  setTimeout(runRefresh, BOOT_DELAY_MS);
-  intervalHandle = setInterval(runRefresh, REFRESH_INTERVAL_MS);
+  const trackedRunRefresh = jobTracker.track("predictions:refresh", runRefresh);
+  setTimeout(trackedRunRefresh, BOOT_DELAY_MS);
+  intervalHandle = setInterval(trackedRunRefresh, REFRESH_INTERVAL_MS);
 
   console.log("[PredictionScheduler] started — refreshing PredictX picks for active non-IPL leagues every 8 hours (3x/day)");
 }

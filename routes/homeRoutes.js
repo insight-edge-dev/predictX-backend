@@ -6,14 +6,18 @@
  * GET /api/home/news      — cricket news (Cricbuzz)
  * GET /api/home/news/:id  — full article (Cricbuzz)
  * GET /api/img/news/:id   — proxied Cricbuzz image
+ * GET /api/home/facts     — admin-editable "Did You Know?" facts
+ * GET /api/home/sections  — admin-configured Discovery section order/visibility
  */
 
 const express  = require("express");
 const axios    = require("axios");
 const sm       = require("../services/sportmonksService");
 const { fetchCricketNews }  = require("../services/newsService");
-const { getCache, setCache } = require("../services/cacheService");
+const { getCache, setCache, TTL } = require("../services/cacheService");
 const { getCachedData, setCachedData } = require("../services/dbService");
+const accuracyService = require("../services/accuracyService");
+const supabase = require("../config/supabase");
 
 const router = express.Router();
 
@@ -326,6 +330,83 @@ router.get("/img/news/:imageId", async (req, res) => {
     return res.send(buf);
   } catch {
     res.status(404).end();
+  }
+});
+
+// ── GET /api/home/facts ───────────────────────────────────────
+// Admin-editable "Did You Know?" facts for Discovery, sport-segmented.
+
+router.get("/home/facts", async (req, res) => {
+  const sport = req.query.sport === "football" ? "football" : "cricket";
+  const cacheKey = `home:facts:${sport}`;
+  try {
+    const mem = getCache(cacheKey);
+    if (mem) return res.json(mem);
+
+    const { data, error } = await supabase
+      .from("home_facts")
+      .select("*")
+      .eq("sport", sport)
+      .eq("is_active", true)
+      .order("display_order", { ascending: true });
+
+    if (error) throw new Error(error.message);
+
+    const facts = data ?? [];
+    setCache(cacheKey, facts, TTL.DAILY);
+    return res.json(facts);
+  } catch (e) {
+    console.error("[Home] facts error:", e.message);
+    return res.status(500).json([]);
+  }
+});
+
+// ── GET /api/home/sections ────────────────────────────────────
+// Admin-configured visibility/order for Discovery's discretionary sections.
+
+router.get("/home/sections", async (_req, res) => {
+  const cacheKey = "home:sections";
+  try {
+    const mem = getCache(cacheKey);
+    if (mem) return res.json(mem);
+
+    const { data, error } = await supabase
+      .from("home_sections")
+      .select("*")
+      .order("display_order", { ascending: true });
+
+    if (error) throw new Error(error.message);
+
+    const sections = data ?? [];
+    setCache(cacheKey, sections, 5 * 60);
+    return res.json(sections);
+  } catch (e) {
+    console.error("[Home] sections error:", e.message);
+    return res.status(500).json([]);
+  }
+});
+
+// ── GET /api/home/accuracy[/:slug] ────────────────────────────
+// Real prediction accuracy %, global or per-league/bucket, admin-overridable.
+
+router.get("/home/accuracy", async (_req, res) => {
+  try {
+    const result = await accuracyService.getGlobalAccuracyPublic();
+    return res.json(result);
+  } catch (e) {
+    console.error("[Home] accuracy error:", e.message);
+    return res.status(500).json({ percentage: 0, sampleSize: 0, isOverridden: false, computedPercentage: 0 });
+  }
+});
+
+router.get("/home/accuracy/:slug", async (req, res) => {
+  try {
+    const result = await accuracyService.getLeagueAccuracyPublic(req.params.slug);
+    if (!result) return res.status(404).json({ error: "Unknown league/bucket slug" });
+    return res.json(result);
+  } catch (e) {
+    console.error(`[Home] accuracy/${req.params.slug} error:`, e.message);
+    return res.status(500).json({ percentage: 0, sampleSize: 0, isOverridden: false, computedPercentage: 0 });
   }
 });
 

@@ -574,47 +574,51 @@ function normalizeBalls(rawBalls) {
     : (Array.isArray(rawBalls?.data) ? rawBalls.data : []);
   if (list.length === 0) return [];
 
-  // Log first ball shape to help debug field names
-  if (list[0]) {
-    console.log("[normalizeBalls] first ball keys:", Object.keys(list[0]).join(", "));
+  // Sportsmonks resets ball/over numbering to 0 at the start of the second
+  // innings (the batting side switches, signalled by team_id changing) —
+  // without splitting on that boundary, overs from both innings collide
+  // into the same overNumber bucket. Keep only the most recent innings,
+  // since that's what a live commentary feed should reflect.
+  let currentTeamId = null;
+  let innings = [];
+  for (const b of list) {
+    if (b.team_id !== currentTeamId) {
+      innings = [];
+      currentTeamId = b.team_id;
+    }
+    innings.push(b);
   }
 
   const overMap = new Map();
 
-  list.forEach((b, idx) => {
-    // Determine over number — try all known Sportsmonks field names
-    let overNum;
-    if (b.ball_descriptor != null) {
-      overNum = Math.floor(Number(b.ball_descriptor));
-    } else if (b.over != null && b.over !== 0) {
-      overNum = Number(b.over);
-    } else if (b.over_number != null) {
-      overNum = Number(b.over_number);
-    } else {
-      // Derive from cumulative ball position: balls 1-6 → over 0, 7-12 → over 1, etc.
-      const cumBall = Number(b.ball) || (idx + 1);
-      overNum = Math.floor((cumBall - 1) / 6);
-    }
-    if (isNaN(overNum) || overNum < 0) overNum = 0;
+  innings.forEach((b) => {
+    // Sportsmonks encodes ball position as "<over>.<ballInOver>", e.g. 4.6 =
+    // 6th ball of the 5th over (0-indexed). Extras (wide/no-ball) can push
+    // the fractional part past 6 (e.g. 4.7) without bumping the over.
+    const ballFloat = Number(b.ball);
+    const overNum     = isNaN(ballFloat) ? 0 : Math.floor(ballFloat);
+    const ballInOver  = isNaN(ballFloat) ? 0 : Math.round((ballFloat - overNum) * 10);
 
     if (!overMap.has(overNum)) {
       overMap.set(overNum, { overNumber: overNum, balls: [], overRuns: 0, wickets: 0 });
     }
 
-    // Normalise runs — try every common field name, force to number
-    const rawRuns = b.runs ?? b.score ?? b.run ?? b.name;
-    const runs    = typeof rawRuns === 'number' ? rawRuns : (parseInt(String(rawRuns), 10) || 0);
+    // Run/boundary/wicket detail lives on the nested `score` resource, not
+    // on the ball record itself.
+    const s        = b.score ?? {};
+    const runs     = Number(s.runs) || 0;
+    const four     = s.four      === true;
+    const six      = s.six       === true;
+    const isWicket = s.is_wicket === true;
 
-    // Booleans — handle both bool and 0/1 int
-    const four     = b.four     === true || b.four     === 1 || b.is_four  === true || b.is_four  === 1;
-    const six      = b.six      === true || b.six      === 1 || b.is_six   === true || b.is_six   === 1;
-    const isWicket = b.is_wicket=== true || b.is_wicket=== 1 || b.wicket  === true || b.wicket   === 1;
+    const batsman = b.batsman?.fullname || "";
+    const bowler  = b.bowler?.fullname  || "";
+    const commentary = bowler && batsman
+      ? `${bowler} to ${batsman}, ${runs} run${runs === 1 ? "" : "s"}` +
+        (isWicket ? " — OUT" : four ? ", FOUR" : six ? ", SIX" : "")
+      : "";
 
-    // Commentary string
-    const commentary = typeof b.commentary === 'string' ? b.commentary
-      : (typeof b.note === 'string' ? b.note : "");
-
-    const delivery = { ball: idx + 1, runs, four, six, isWicket, commentary };
+    const delivery = { ball: ballInOver, runs, four, six, isWicket, commentary };
 
     const over = overMap.get(overNum);
     over.balls.push(delivery);

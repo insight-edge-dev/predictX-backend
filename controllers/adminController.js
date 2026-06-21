@@ -30,7 +30,9 @@ const leagueService       = require("../services/leagueService");
 const footballService     = require("../services/footballService");
 const intlService         = require("../services/internationalService");
 const adminDashboardService = require("../services/adminDashboardService");
+const accuracyService       = require("../services/accuracyService");
 const cloudinaryService    = require("../services/cloudinaryService");
+const { delCache, KEYS }   = require("../services/cacheService");
 
 const BANNER_LINK_TYPES = ["none", "external", "match", "tip", "league_home", "app_section"];
 
@@ -237,6 +239,38 @@ async function getMatchMonitor(req, res) {
   }
 }
 
+async function getSystemHealth(req, res) {
+  try {
+    const health = await adminDashboardService.getSystemHealth();
+    return res.json(health);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function refreshLeague(req, res) {
+  const { slug } = req.params;
+  try {
+    if (LEAGUES[slug]) {
+      delCache(KEYS.LEAGUE_FIXTURES(slug));
+      delCache(`league:live:${slug}`);
+      return res.json({ refreshed: slug });
+    }
+    if (FOOTBALL_LEAGUES[slug]) {
+      await footballService.refreshFromAPI();
+      return res.json({ refreshed: slug });
+    }
+    const intlBucket = intlService.INTERNATIONAL_LEAGUES[slug];
+    if (intlBucket) {
+      delCache(KEYS.INTL_SERIES_LIST(slug));
+      return res.json({ refreshed: slug });
+    }
+    return res.status(404).json({ error: `Unknown league/bucket slug: ${slug}` });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
 async function listUsersAdmin(req, res) {
   try {
     const { search = "", page = "1", limit = "20" } = req.query;
@@ -390,6 +424,267 @@ async function deleteBanner(req, res) {
   return res.json({ success: true });
 }
 
+// ── Home Facts ("Did You Know?") ──────────────────────────────
+
+const FACT_SPORTS = ["cricket", "football"];
+
+function invalidateFactsCache(sport) {
+  delCache(`home:facts:${sport}`);
+}
+
+async function createFact(req, res) {
+  const { sport, icon, text, color, display_order, is_active } = req.body;
+
+  if (!FACT_SPORTS.includes(sport)) {
+    return res.status(400).json({ error: `sport must be one of: ${FACT_SPORTS.join(", ")}` });
+  }
+  if (!icon?.trim() || !text?.trim()) {
+    return res.status(400).json({ error: "icon and text are required" });
+  }
+
+  const { data, error } = await supabase
+    .from("home_facts")
+    .insert({
+      sport,
+      icon: icon.trim(),
+      text: text.trim(),
+      color: color?.trim() || "#F59E0B",
+      display_order: Number(display_order) || 0,
+      is_active: is_active ?? true,
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  invalidateFactsCache(sport);
+  return res.json({ fact: data });
+}
+
+async function listFactsAdmin(req, res) {
+  const { data, error } = await supabase
+    .from("home_facts")
+    .select("*")
+    .order("sport", { ascending: true })
+    .order("display_order", { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ facts: data ?? [] });
+}
+
+async function updateFact(req, res) {
+  const { id } = req.params;
+  const { sport, icon, text, color, display_order, is_active } = req.body;
+
+  if (sport !== undefined && !FACT_SPORTS.includes(sport)) {
+    return res.status(400).json({ error: `sport must be one of: ${FACT_SPORTS.join(", ")}` });
+  }
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("home_facts")
+    .select("sport")
+    .eq("id", id)
+    .single();
+  if (fetchError) return res.status(404).json({ error: "fact not found" });
+
+  const updates = {};
+  if (sport         !== undefined) updates.sport         = sport;
+  if (icon           !== undefined) updates.icon          = icon.trim();
+  if (text           !== undefined) updates.text          = text.trim();
+  if (color          !== undefined) updates.color         = color.trim();
+  if (display_order !== undefined) updates.display_order = Number(display_order) || 0;
+  if (is_active      !== undefined) updates.is_active     = is_active;
+
+  const { data, error } = await supabase
+    .from("home_facts")
+    .update(updates)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  invalidateFactsCache(existing.sport);
+  if (sport && sport !== existing.sport) invalidateFactsCache(sport);
+  return res.json({ fact: data });
+}
+
+async function reorderFacts(req, res) {
+  const { order } = req.body;
+  if (!Array.isArray(order) || order.length === 0) {
+    return res.status(400).json({ error: "order must be a non-empty array of fact ids" });
+  }
+
+  const sports = new Set();
+  for (let i = 0; i < order.length; i++) {
+    const { data, error } = await supabase
+      .from("home_facts")
+      .update({ display_order: i })
+      .eq("id", order[i])
+      .select("sport")
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+    sports.add(data.sport);
+  }
+
+  sports.forEach(invalidateFactsCache);
+  return res.json({ success: true });
+}
+
+async function deleteFact(req, res) {
+  const { id } = req.params;
+
+  const { data: existing, error: fetchError } = await supabase
+    .from("home_facts")
+    .select("sport")
+    .eq("id", id)
+    .single();
+  if (fetchError) return res.status(404).json({ error: "fact not found" });
+
+  const { error } = await supabase.from("home_facts").delete().eq("id", id);
+  if (error) return res.status(500).json({ error: error.message });
+
+  invalidateFactsCache(existing.sport);
+  return res.json({ success: true });
+}
+
+// ── League Priority ────────────────────────────────────────────
+
+async function listLeaguePriority(req, res) {
+  try {
+    const { data: settings, error } = await supabase.from("league_settings").select("*");
+    if (error) throw new Error(error.message);
+
+    const prioMap = new Map((settings ?? []).map(s => [s.slug, s.priority]));
+    const all = [...Object.values(LEAGUES), ...Object.values(FOOTBALL_LEAGUES)];
+    const leagues = all.map(l => ({
+      slug: l.slug, name: l.name, short: l.short, flag: l.flag, sport: l.sport ?? "cricket",
+      priority: prioMap.get(l.slug) ?? 0,
+    }));
+
+    return res.json({ leagues });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function setLeaguePriority(req, res) {
+  const { slug } = req.params;
+  const { priority } = req.body;
+  if (priority === undefined || Number.isNaN(Number(priority))) {
+    return res.status(400).json({ error: "priority must be a number" });
+  }
+
+  const { error } = await supabase
+    .from("league_settings")
+    .upsert({ slug, priority: Number(priority), updated_at: new Date().toISOString() });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  delCache("all_leagues_dynamic");
+  return res.json({ slug, priority: Number(priority) });
+}
+
+// ── Home Sections ──────────────────────────────────────────────
+
+function invalidateSectionsCache() {
+  delCache("home:sections");
+}
+
+async function listHomeSectionsAdmin(req, res) {
+  const { data, error } = await supabase
+    .from("home_sections")
+    .select("*")
+    .order("display_order", { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ sections: data ?? [] });
+}
+
+async function setHomeSectionEnabled(req, res) {
+  const { key } = req.params;
+  const { enabled } = req.body;
+  if (typeof enabled !== "boolean") {
+    return res.status(400).json({ error: "enabled must be a boolean" });
+  }
+
+  const { data, error } = await supabase
+    .from("home_sections")
+    .update({ enabled })
+    .eq("key", key)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  invalidateSectionsCache();
+  return res.json({ section: data });
+}
+
+async function reorderHomeSections(req, res) {
+  const { order } = req.body;
+  if (!Array.isArray(order) || order.length === 0) {
+    return res.status(400).json({ error: "order must be a non-empty array of section keys" });
+  }
+
+  for (let i = 0; i < order.length; i++) {
+    const { error } = await supabase
+      .from("home_sections")
+      .update({ display_order: i })
+      .eq("key", order[i]);
+    if (error) return res.status(500).json({ error: error.message });
+  }
+
+  invalidateSectionsCache();
+  return res.json({ success: true });
+}
+
+// ── Prediction Accuracy ─────────────────────────────────────────
+
+async function listAccuracyAdmin(req, res) {
+  try {
+    const all = [
+      { slug: "global", name: "Global (all leagues)" },
+      ...Object.values(LEAGUES).map(l => ({ slug: l.slug, name: l.name })),
+      ...Object.values(FOOTBALL_LEAGUES).map(l => ({ slug: l.slug, name: l.name })),
+      ...Object.values(intlService.INTERNATIONAL_LEAGUES).map(b => ({ slug: b.slug, name: b.name })),
+    ];
+
+    const { data: overrides, error } = await supabase.from("accuracy_overrides").select("*");
+    if (error) throw new Error(error.message);
+    const overrideMap = new Map((overrides ?? []).map(o => [o.key, o.override_pct]));
+
+    const rows = await Promise.all(all.map(async ({ slug, name }) => {
+      const computed = slug === "global"
+        ? await accuracyService.computeGlobalAccuracy()
+        : await accuracyService.computeLeagueAccuracy(slug);
+      return {
+        slug,
+        name,
+        computedPercentage: computed?.percentage ?? 0,
+        sampleSize: computed?.total ?? 0,
+        override: overrideMap.get(slug) ?? null,
+      };
+    }));
+
+    return res.json({ rows });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function setAccuracyOverride(req, res) {
+  const { key } = req.params;
+  const { override } = req.body;
+  if (override !== null && Number.isNaN(Number(override))) {
+    return res.status(400).json({ error: "override must be a number or null" });
+  }
+
+  try {
+    await accuracyService.setOverride(key, override === null ? null : Number(override));
+    return res.json({ key, override: override === null ? null : Number(override) });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
 module.exports = {
   createNotification,
   listNotificationsAdmin,
@@ -401,6 +696,8 @@ module.exports = {
   getUpcomingMatchesPicker,
   getOverview,
   getMatchMonitor,
+  getSystemHealth,
+  refreshLeague,
   listUsersAdmin,
   uploadBannerImage,
   createBanner,
@@ -408,4 +705,16 @@ module.exports = {
   updateBanner,
   reorderBanners,
   deleteBanner,
+  createFact,
+  listFactsAdmin,
+  updateFact,
+  reorderFacts,
+  deleteFact,
+  listLeaguePriority,
+  setLeaguePriority,
+  listHomeSectionsAdmin,
+  setHomeSectionEnabled,
+  reorderHomeSections,
+  listAccuracyAdmin,
+  setAccuracyOverride,
 };

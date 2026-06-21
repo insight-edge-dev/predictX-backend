@@ -1,41 +1,73 @@
 /**
- * footballSchedulerService.js — keeps Supabase football data fresh by calling
- * the live football-data.org API exactly 3 times a day (every 8 hours).
+ * footballSchedulerService.js — keeps football data fresh via two independent
+ * loops:
  *
- * This is the ONLY trigger for football-data.org calls in the whole app —
- * user requests are always served from cache/DB (see footballService.js).
- * Free tier allows 10 req/min, so even running every 8h with 2 endpoint
- * calls per run (fixtures + standings) stays far under any limit.
+ *  1. Full sync, every 8 hours — fixtures + standings, plus a throttled
+ *     backfill of goal events for live/newly-completed matches (up to ~20
+ *     calls, 7s apart). This is the only loop that writes to Supabase.
+ *     See footballService.refreshFromAPI/enrichWithEvents.
+ *
+ *  2. Live-score poll, every 60 seconds — a single lightweight call that
+ *     updates ONLY status/score/minute on whichever matches are (or were)
+ *     live. Without this, a live match's score/clock would stay frozen at
+ *     whatever it was during the last full sync for up to 8 hours — which
+ *     is exactly what users were seeing before this loop existed.
+ *     NodeCache-only; never touches Supabase. See footballService.refreshLiveScores.
+ *
+ * Both loops call football-data.org directly — these are the ONLY triggers
+ * for football-data.org calls in the whole app; user requests are always
+ * served from cache/DB. Free tier allows 10 req/min: the live poll uses 1
+ * call/min and the full sync's backfill is throttled, so combined usage
+ * stays far under any limit.
  */
 
 const footballService = require("./footballService");
+const jobTracker      = require("./jobTracker");
 
-const REFRESH_INTERVAL_MS = 8 * 60 * 60 * 1000; // 24h / 3 = 8h
-const BOOT_DELAY_MS       = 15 * 1000;          // let the server finish booting first
+const FULL_REFRESH_INTERVAL_MS = 8 * 60 * 60 * 1000; // 24h / 3 = 8h
+const LIVE_POLL_INTERVAL_MS    = 60 * 1000;          // 60s
+const BOOT_DELAY_MS            = 15 * 1000;          // let the server finish booting first
 
-let intervalHandle = null;
+let fullIntervalHandle = null;
+let liveIntervalHandle = null;
 
-async function runRefresh() {
-  console.log("[FootballScheduler] running scheduled football-data.org refresh…");
+// Tracked at the service-call level (not the outer runX wrapper) so
+// jobTracker sees the real success/failure before the existing try/catch
+// here swallows it for logging purposes.
+const trackedRefreshFromAPI   = jobTracker.track("football:fullRefresh", footballService.refreshFromAPI);
+const trackedRefreshLiveScores = jobTracker.track("football:livePoll",   footballService.refreshLiveScores);
+
+async function runFullRefresh() {
+  console.log("[FootballScheduler] running scheduled football-data.org full refresh…");
   try {
-    const result = await footballService.refreshFromAPI();
-    console.log(`[FootballScheduler] refresh complete — ${result.fixtures} fixtures, ${result.groups} groups synced`);
+    const result = await trackedRefreshFromAPI();
+    console.log(`[FootballScheduler] full refresh complete — ${result.fixtures} fixtures, ${result.groups} groups synced`);
   } catch (e) {
-    console.warn("[FootballScheduler] refresh failed —", e.message);
+    console.warn("[FootballScheduler] full refresh failed —", e.message);
+  }
+}
+
+async function runLivePoll() {
+  try {
+    const updated = await trackedRefreshLiveScores();
+    if (updated > 0) console.log(`[FootballScheduler] live poll — ${updated} match(es) updated`);
+  } catch (e) {
+    console.warn("[FootballScheduler] live poll failed —", e.message);
   }
 }
 
 /**
- * Starts the scheduler: one initial refresh shortly after boot, then every 8h.
- * Safe to call once at server startup.
+ * Starts both loops: one initial full refresh shortly after boot then every
+ * 8h, and a live-score poll every 60s. Safe to call once at server startup.
  */
 function start() {
-  if (intervalHandle) return;
+  if (fullIntervalHandle) return;
 
-  setTimeout(runRefresh, BOOT_DELAY_MS);
-  intervalHandle = setInterval(runRefresh, REFRESH_INTERVAL_MS);
+  setTimeout(runFullRefresh, BOOT_DELAY_MS);
+  fullIntervalHandle = setInterval(runFullRefresh, FULL_REFRESH_INTERVAL_MS);
+  liveIntervalHandle = setInterval(runLivePoll, LIVE_POLL_INTERVAL_MS);
 
-  console.log("[FootballScheduler] started — refreshing football data every 8 hours (3x/day)");
+  console.log("[FootballScheduler] started — full refresh every 8h, live-score poll every 60s");
 }
 
 module.exports = { start };

@@ -95,7 +95,16 @@ async function getLeagueLiveMatches(league) {
     .filter(f => seasonId && f.season_id === seasonId)
     .map(f => normalizeFixture(f))
     .filter(Boolean)
-    .map(m => ({ ...m, status: "live" }));
+    .map(m => ({
+      ...m,
+      status: "live",
+      // normalizeFixture sets statusText to "Match starts at <time>" only when
+      // it computed status as "upcoming" — but this fixture is from Sportsmonks'
+      // own /livescores feed, so it's actually in progress and that raw status
+      // was simply lagging. Don't let the now-false "Match starts at" text
+      // leak through once we know better; let the UI's own live fallback show.
+      statusText: /^Match starts at/.test(m.statusText) ? "" : m.statusText,
+    }));
 
   setCache(memKey, live, TTL.LIVE);
   return live;

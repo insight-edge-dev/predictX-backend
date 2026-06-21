@@ -24,6 +24,22 @@ const FOOTBALL_LEAGUE_LIST = Object.values(FOOTBALL_LEAGUES).map(l => ({
 const leagueService            = require("../services/leagueService");
 const sm                       = require("../services/sportmonksService");
 const { getCache, setCache, TTL } = require("../services/cacheService");
+const supabase                 = require("../config/supabase");
+
+// Admin-set "featured/pinned" override (league_settings table) — merged onto
+// every league object so the Matches/PredictX accordions can sort featured
+// leagues to the top. Higher priority = shown first; 0 = no override.
+async function attachPriority(leagues) {
+  try {
+    const { data, error } = await supabase.from("league_settings").select("slug, priority");
+    if (error) throw new Error(error.message);
+    const prioMap = new Map((data ?? []).map(s => [s.slug, s.priority]));
+    return leagues.map(l => ({ ...l, priority: prioMap.get(l.slug) ?? 0 }));
+  } catch (e) {
+    console.warn("[LeagueCtrl] attachPriority failed —", e.message);
+    return leagues.map(l => ({ ...l, priority: 0 }));
+  }
+}
 
 // Generic international buckets that are NOT real franchise leagues — they
 // contain hundreds of unrelated bilateral tours and are handled separately
@@ -88,7 +104,7 @@ async function listLeagues(_req, res) {
       flag: l.flag, country: l.country, format: l.format, image: "",
     }));
     console.warn("[LeagueCtrl] listLeagues: Sportsmonks returned no data — using hardcoded config");
-    return res.json({ leagues: [...list, ...FOOTBALL_LEAGUE_LIST] });
+    return res.json({ leagues: await attachPriority([...list, ...FOOTBALL_LEAGUE_LIST]) });
   }
 
   // Build leagueId → most-recent season map from batch response
@@ -156,7 +172,7 @@ async function listLeagues(_req, res) {
       return a.name.localeCompare(b.name);
     });
 
-  const unique = deduplicateSlugs([...leagues, ...FOOTBALL_LEAGUE_LIST]);
+  const unique = await attachPriority(deduplicateSlugs([...leagues, ...FOOTBALL_LEAGUE_LIST]));
   setCache(MEM_KEY, unique, TTL.DAILY);
   console.log(`[LeagueCtrl] listLeagues: ${unique.length} leagues total (incl. football)`);
   res.json({ leagues: unique });

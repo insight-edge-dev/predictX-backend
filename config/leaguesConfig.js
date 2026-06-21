@@ -141,7 +141,7 @@ const FOOTBALL_LEAGUES = {
   wc2026: {
     slug:     'wc2026',
     name:     'FIFA World Cup 2026',
-    short:    'WC 2026',
+    short:    'WC',
     season:   '2026',
     competitionCode: 'WC',  // football-data.org competition code for FIFA World Cup
     flag:     '🏆',

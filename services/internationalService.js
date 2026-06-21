@@ -73,7 +73,11 @@ async function enrichLiveMatch(m) {
       score2:     fresh.score2 ?? m.score2,
       overs1:     fresh.overs1 ?? m.overs1,
       overs2:     fresh.overs2 ?? m.overs2,
-      statusText: fresh.statusText || m.statusText,
+      // Never let a stale pre-match "Match starts at" string leak through for
+      // a fixture we already know is live — same desync class as
+      // leagueService.getLeagueLiveMatches (normalizeFixture only writes
+      // that text when its raw status read "upcoming", which can lag).
+      statusText: fresh.statusText || (/^Match starts at/.test(m.statusText) ? "" : m.statusText),
       batsmen:    fresh.batsmen.length ? fresh.batsmen : m.batsmen,
       bowlers:    fresh.bowlers.length ? fresh.bowlers : m.bowlers,
       toss:       fresh.toss ?? m.toss,
@@ -232,4 +236,5 @@ module.exports = {
   getSeriesList,
   getSeriesDetail,
   findMatch,
+  effectiveStatus,
 };

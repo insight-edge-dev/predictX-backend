@@ -11,6 +11,9 @@ const { LEAGUES, FOOTBALL_LEAGUES } = require("../config/leaguesConfig");
 const leagueService = require("./leagueService");
 const footballService = require("./footballService");
 const internationalService = require("./internationalService");
+const cacheService = require("./cacheService");
+const jobTracker = require("./jobTracker");
+const sm = require("./sportmonksService");
 
 const STARTED_BUFFER_MS = 4 * 60 * 60 * 1000; // mirrors internationalService
 
@@ -102,6 +105,19 @@ async function getMatchMonitor() {
   return { leagues, live };
 }
 
+// ── System health: per-league freshness + scheduled jobs + cache + quota ──
+
+async function getSystemHealth() {
+  const { leagues } = await getMatchMonitor();
+
+  return {
+    leagues,
+    jobs: jobTracker.getAll(),
+    cache: cacheService.listEntries(),
+    sportmonks: sm.getRateLimitStatus(),
+  };
+}
+
 // ── Overview stats ─────────────────────────────────────────────
 
 async function getOverviewStats() {
@@ -163,6 +179,7 @@ async function listUsers({ search = "", page = 1, limit = 20 }) {
 
 module.exports = {
   getMatchMonitor,
+  getSystemHealth,
   getOverviewStats,
   listUsers,
 };

@@ -122,4 +122,11 @@ function getStats() {
   return cache.getStats();
 }
 
-module.exports = { getCache, setCache, delCache, flushCache, getStats, TTL, KEYS };
+function listEntries() {
+  return cache.keys().map((key) => {
+    const ttl = cache.getTtl(key);
+    return { key, ttlMs: ttl ? ttl - Date.now() : null };
+  });
+}
+
+module.exports = { getCache, setCache, delCache, flushCache, getStats, listEntries, TTL, KEYS };

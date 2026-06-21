@@ -388,6 +388,21 @@ async function deleteAllSquads() {
   }
 }
 
+/** Bulk-fetch all rows in the `series` table whose id starts with prefix, as a Map<id, data>. */
+async function getCachedDataByPrefix(prefix) {
+  try {
+    const { data, error } = await supabase
+      .from("series")
+      .select("id, data")
+      .like("id", `${prefix}%`);
+    if (error) throw new Error(error.message);
+    return new Map((data ?? []).map(row => [row.id, row.data]));
+  } catch (e) {
+    console.warn(`[DB] getCachedDataByPrefix(${prefix}) failed:`, e.message);
+    return new Map();
+  }
+}
+
 /** Delete all rows in the `series` table whose id starts with prefix. */
 async function deleteCachedByPrefix(prefix) {
   try {
@@ -416,6 +431,7 @@ module.exports = {
   deleteFixtures,
   getCachedData,
   setCachedData,
+  getCachedDataByPrefix,
   deleteAllMatches,
   deleteAllSquads,
   deleteCachedByPrefix,

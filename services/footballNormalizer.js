@@ -102,6 +102,22 @@ function enrichTeam(raw) {
   };
 }
 
+// ── Live minute estimate ────────────────────────────────────────────
+// football-data.org doesn't expose a live match clock on any endpoint
+// (list or detail) — we approximate it from elapsed wall-clock time since
+// kickoff, assuming a standard 45+15+45 structure. Inherently inexact
+// (stoppage time, actual halftime length, kickoff delays aren't known),
+// but far better than showing a bare "LIVE" with no time context.
+
+function estimateMinute(utcDate, rawStatus) {
+  if (rawStatus !== "IN_PLAY") return null; // PAUSED (HT) shows "Half-Time" instead; others n/a
+  const elapsedMin = Math.floor((Date.now() - new Date(utcDate).getTime()) / 60_000);
+  if (elapsedMin < 0) return null;
+  if (elapsedMin <= 45) return Math.max(elapsedMin, 1);
+  if (elapsedMin <= 60) return 45;                 // assumed halftime break window
+  return Math.min(45 + (elapsedMin - 60), 90);     // second half resumes at +60
+}
+
 // ── Fixture normalizer ────────────────────────────────────────────
 
 function normalizeFixture(raw) {
@@ -126,7 +142,7 @@ function normalizeFixture(raw) {
     },
     status,
     statusText,
-    minute:     null,   // not exposed on list/competition endpoints
+    minute:     estimateMinute(raw.utcDate, raw.status),
     venue:      raw.venue ?? "",
     city:       "",
     date,
@@ -201,4 +217,31 @@ function normalizeGroups(rawStandings) {
   return result;
 }
 
-module.exports = { normalizeFixture, normalizeStanding, normalizeGroups };
+// ── Goal events (from the per-match detail endpoint only) ──────────
+// Source schema (per goal, within detail response's `goals[]`):
+// { minute, injuryTime, type: "REGULAR"|"OWN"|"PENALTY", team: {id,name},
+//   scorer: {id,name}, assist: {id,name}|null }
+
+function normalizeGoal(g) {
+  return {
+    minute:   g.minute ?? 0,
+    extra:    g.injuryTime ?? null,
+    teamId:   String(g.team?.id ?? ""),
+    teamName: g.team?.name ?? "",
+    player:   g.scorer?.name ?? "Unknown",
+    assist:   g.assist?.name ?? null,
+    type:     "Goal",
+    detail:   g.type === "OWN" ? "Own Goal" : g.type === "PENALTY" ? "Penalty" : "Normal Goal",
+    comments: null,
+  };
+}
+
+/** Maps a match-detail response's raw `goals[]` to the app's FootballEvent[]. */
+function normalizeGoals(rawGoals) {
+  if (!Array.isArray(rawGoals)) return [];
+  return rawGoals
+    .map(normalizeGoal)
+    .sort((a, b) => (a.minute + (a.extra ?? 0)) - (b.minute + (b.extra ?? 0)));
+}
+
+module.exports = { normalizeFixture, normalizeStanding, normalizeGroups, normalizeGoals };

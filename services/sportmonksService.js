@@ -30,6 +30,10 @@ function _key() {
   return process.env.SPORTMONKS_API_KEY || "";
 }
 
+function getRateLimitStatus() {
+  return { limited: Date.now() < _rateLimitUntil, until: _rateLimitUntil || null };
+}
+
 // ── Core fetch ────────────────────────────────────────────────
 
 async function _fetch(endpoint, params = {}) {
@@ -379,4 +383,5 @@ module.exports = {
   getPlayersList,
   getTeamRankings,
   getSeasonFixturesWithStats,
+  getRateLimitStatus,
 };
