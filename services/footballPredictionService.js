@@ -27,7 +27,12 @@
  */
 
 const wcHistory = require("./wcHistoryLoader");
+const db = require("./dbService");
 const { getCache, setCache, TTL, KEYS } = require("./cacheService");
+
+// Predictions are static (pre-match historical data) — never expire in DB.
+// Mirrors tipsController.js's getPersistentLightTip TTL for cricket.
+const PRED_TTL_DB = 365 * 24 * 60 * 60_000; // 1 year
 
 // ── Placeholder guard ─────────────────────────────────────────────
 function isPlaceholderTeam(team) {
@@ -312,11 +317,24 @@ async function getMatchPrediction(match) {
   if (isPlaceholderTeam(match.homeTeam) || isPlaceholderTeam(match.awayTeam)) return null;
 
   const key = KEYS.FOOTBALL_TIP(match.id);
+
+  // 1. Memory cache (fastest)
   const hot = getCache(key);
   if (hot) return hot;
 
+  // 2. Supabase DB (survives restarts — previously this service only cached
+  // in memory, so accuracyService's league-cards/accuracy lookups, which read
+  // predictions from Supabase, never found any football predictions)
+  const stored = await db.getCachedData(key, PRED_TTL_DB);
+  if (stored) {
+    setCache(key, stored, TTL.FOOTBALL_TIP);
+    return stored;
+  }
+
+  // 3. Generate and persist
   const prediction = await buildPrediction(match);
   setCache(key, prediction, TTL.FOOTBALL_TIP);
+  void db.setCachedData(key, prediction); // fire-and-forget write to DB
   return prediction;
 }
 

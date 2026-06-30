@@ -410,4 +410,14 @@ router.get("/home/accuracy/:slug", async (req, res) => {
   }
 });
 
+router.get("/home/league-cards", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 5, 10);
+  try {
+    return res.json({ cards: await accuracyService.getLeagueCardsPublic(limit) });
+  } catch (e) {
+    console.error("[Home] league-cards error:", e.message);
+    return res.status(500).json({ cards: [] });
+  }
+});
+
 module.exports = router;

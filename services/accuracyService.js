@@ -16,6 +16,8 @@ const { LEAGUES, FOOTBALL_LEAGUES } = require("../config/leaguesConfig");
 const leagueService = require("./leagueService");
 const footballService = require("./footballService");
 const internationalService = require("./internationalService");
+const sm = require("./sportmonksService");
+const tipsController = require("../controllers/tipsController");
 
 const ACCURACY_TTL_S = 60 * 60; // 1h — match outcomes don't change retroactively
 
@@ -110,6 +112,228 @@ async function computeInternationalBucketTally(bucket, cricketPredictions) {
   const fixtures = await internationalService.getBucketFixtures(bucket);
   const completed = fixtures.filter(m => internationalService.effectiveStatus(m) === "completed");
   return tally(completed, cricketPredictions, resolveCricketResult, "pred:light:");
+}
+
+// ── Per-match row shaping (shared by the league-cards feature below) ──────
+
+function buildRows(matches, predictionsMap, resolver, keyPrefix, toRow) {
+  const rows = [];
+  for (const m of matches) {
+    const pred = predictionsMap.get(`${keyPrefix}${m.id}`);
+    if (!pred) continue;
+    const result = resolver(pred.winner, m);
+    if (result === null) continue;
+    rows.push(toRow(m, pred.winner, result === "correct"));
+  }
+  return rows;
+}
+
+function cricketRow(leagueLabel) {
+  return (m, predictedWinner, isCorrect) => ({
+    id: m.id, sport: "cricket", leagueLabel, date: m.date,
+    team1: { name: m.team1?.name, shortName: m.team1?.shortName, logo: m.team1?.logo, score: m.score1 ?? null, overs: m.overs1 ?? null },
+    team2: { name: m.team2?.name, shortName: m.team2?.shortName, logo: m.team2?.logo, score: m.score2 ?? null, overs: m.overs2 ?? null },
+    predictedWinner, actualResult: m.winner, resultText: m.statusText ?? null, isCorrect, isUpcoming: false,
+  });
+}
+
+function footballRow(leagueLabel) {
+  return (m, predictedWinner, isCorrect) => ({
+    id: m.id, sport: "football", leagueLabel, date: m.date,
+    team1: { name: m.homeTeam?.name, shortName: m.homeTeam?.shortName, logo: m.homeTeam?.logo, score: m.score?.home ?? null, overs: null },
+    team2: { name: m.awayTeam?.name, shortName: m.awayTeam?.shortName, logo: m.awayTeam?.logo, score: m.score?.away ?? null, overs: null },
+    predictedWinner, actualResult: `${m.score?.home}–${m.score?.away}`, resultText: null, isCorrect, isUpcoming: false,
+  });
+}
+
+function sortByDateDesc(rows) {
+  return [...rows].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+}
+
+// ── Per-league prediction track record (Discovery "PredictX Prediction" cards) ──
+// One card per league/bucket/football — its own accuracy (override-aware, same
+// figure shown elsewhere for that league), plus either:
+//   - a completed tournament (its Final has been played): the Final + previous matches
+//   - an ongoing tournament: the next upcoming match (with our pick) + recent results
+
+async function getLeagueImageMap() {
+  try {
+    const rawLeagues = await sm.getAllLeagues();
+    const map = new Map();
+    if (Array.isArray(rawLeagues)) {
+      for (const l of rawLeagues) map.set(l.id, l.image_path ?? "");
+    }
+    return map;
+  } catch (e) {
+    console.warn("[Accuracy] league cards: logo lookup failed:", e.message);
+    return new Map();
+  }
+}
+
+function buildUpcomingRow(match, predictionsMap, keyPrefix, rowBuilder) {
+  if (!match) return null;
+  const pred = predictionsMap.get(`${keyPrefix}${match.id}`);
+  if (!pred) return null;
+  return { ...rowBuilder(match, pred.winner, null), isUpcoming: true, actualResult: null, resultText: null };
+}
+
+// IPL predictions are generated lazily (only when a user opens that match) —
+// every other cricket scope is covered proactively by predictionSchedulerService,
+// so this on-demand generation is needed for IPL alone.
+async function ensureUpcomingPrediction(slug, match, predictionsMap, keyPrefix) {
+  if (!match || slug !== "ipl") return;
+  const key = `${keyPrefix}${match.id}`;
+  if (predictionsMap.has(key)) return;
+  try {
+    const tip = await tipsController.getPersistentLightTip(match, { isIPL: true });
+    if (tip) predictionsMap.set(key, tip);
+  } catch (e) {
+    console.warn(`[Accuracy] league cards: on-demand IPL tip for match ${match.id} failed:`, e.message);
+  }
+}
+
+function selectCardRows(seasonOver, finalMatchId, upcomingRow, rows, cap) {
+  if (seasonOver) {
+    const finalRow = finalMatchId != null ? rows.find(r => r.id === finalMatchId) : null;
+    if (finalRow) {
+      const rest = rows.filter(r => r.id !== finalMatchId).slice(0, cap - 1);
+      return [finalRow, ...rest];
+    }
+    return rows.slice(0, cap);
+  }
+  const recents = rows.slice(0, cap - (upcomingRow ? 1 : 0));
+  return upcomingRow ? [upcomingRow, ...recents] : recents;
+}
+
+async function getCardSettingsMap() {
+  try {
+    const { data, error } = await supabase.from("league_card_settings").select("*");
+    if (error) throw new Error(error.message);
+    return new Map((data ?? []).map(s => [s.slug, s]));
+  } catch (e) {
+    console.warn("[Accuracy] league cards: settings lookup failed:", e.message);
+    return new Map();
+  }
+}
+
+async function computeLeagueCards(perLeagueLimit = 5) {
+  const cards = [];
+
+  const [cricketPredictions, footballPredictions, leagueImages, cardSettings] = await Promise.all([
+    db.getCachedDataByPrefix("pred:light:"),
+    db.getCachedDataByPrefix("football:tip:"),
+    getLeagueImageMap(),
+    getCardSettingsMap(),
+  ]);
+
+  // Admin-controlled visibility/order (backend/controllers/adminController.js's
+  // `allLeagueCardSlugs()` builds the same canonical traversal order — a card
+  // with no settings row yet falls back to its position in that order, so it
+  // shows up in a stable spot rather than jumping to the front.
+  let naturalIndex = 0;
+  const orderMap = new Map();
+  function isCardVisible(slug) {
+    const s = cardSettings.get(slug);
+    return s ? s.is_visible !== false : true;
+  }
+  function trackCardOrder(slug) {
+    const s = cardSettings.get(slug);
+    orderMap.set(slug, s ? s.display_order : naturalIndex);
+    naturalIndex++;
+  }
+
+  for (const league of Object.values(LEAGUES)) {
+    trackCardOrder(league.slug);
+    if (!isCardVisible(league.slug)) continue;
+    try {
+      const { upcoming, completed } = await leagueService.getLeagueMatches(league);
+      const rows = sortByDateDesc(buildRows(completed, cricketPredictions, resolveCricketResult, "pred:light:", cricketRow(league.short)));
+
+      const seasonOver = completed.length > 0 && completed[0].matchStage === "FINAL";
+      const finalMatch = seasonOver ? completed.find(m => m.matchStage === "FINAL") : null;
+
+      let upcomingRow = null;
+      if (!seasonOver && upcoming.length > 0) {
+        await ensureUpcomingPrediction(league.slug, upcoming[0], cricketPredictions, "pred:light:");
+        upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(league.short));
+      }
+
+      cards.push({
+        slug: league.slug, name: league.name, season: league.season, flag: league.flag,
+        short: league.short, image: leagueImages.get(league.leagueId) || "", sport: "cricket",
+        accuracy: await getLeagueAccuracyPublic(league.slug),
+        recentMatches: selectCardRows(seasonOver, finalMatch?.id, upcomingRow, rows, perLeagueLimit),
+      });
+    } catch (e) {
+      console.warn(`[Accuracy] league cards: cricket league ${league.slug} failed:`, e.message);
+    }
+  }
+
+  for (const footballLeague of Object.values(FOOTBALL_LEAGUES)) {
+    trackCardOrder(footballLeague.slug);
+    if (!isCardVisible(footballLeague.slug)) continue;
+    try {
+      const { upcoming, completed } = await footballService.getMatches();
+      const rows = sortByDateDesc(buildRows(completed, footballPredictions, resolveFootballResult, "football:tip:", footballRow(footballLeague.short)));
+
+      const seasonOver = completed.length > 0 && completed[0].stage === "Final";
+      const finalMatch = seasonOver ? completed.find(m => m.stage === "Final") : null;
+
+      // Football predictions aren't persisted to Supabase today (a pre-existing gap,
+      // out of scope here) — upcomingRow will normally come back null, and the card
+      // gracefully falls back to recent-completed-only.
+      let upcomingRow = null;
+      if (!seasonOver && upcoming.length > 0) {
+        upcomingRow = buildUpcomingRow(upcoming[0], footballPredictions, "football:tip:", footballRow(footballLeague.short));
+      }
+
+      cards.push({
+        slug: footballLeague.slug, name: footballLeague.name, season: footballLeague.season, flag: footballLeague.flag,
+        short: footballLeague.short, image: footballLeague.image ?? "", sport: "football",
+        accuracy: await getLeagueAccuracyPublic(footballLeague.slug),
+        recentMatches: selectCardRows(seasonOver, finalMatch?.id, upcomingRow, rows, perLeagueLimit),
+      });
+    } catch (e) {
+      console.warn(`[Accuracy] league cards: football ${footballLeague.slug} failed:`, e.message);
+    }
+  }
+
+  // Bilateral series buckets never "finish" as a competition — always ongoing.
+  for (const bucket of Object.values(internationalService.INTERNATIONAL_LEAGUES)) {
+    trackCardOrder(bucket.slug);
+    if (!isCardVisible(bucket.slug)) continue;
+    try {
+      const fixtures = await internationalService.getBucketFixtures(bucket);
+      const completed = fixtures.filter(m => internationalService.effectiveStatus(m) === "completed");
+      const upcoming = fixtures
+        .filter(m => internationalService.effectiveStatus(m) === "upcoming")
+        .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      const rows = sortByDateDesc(buildRows(completed, cricketPredictions, resolveCricketResult, "pred:light:", cricketRow(bucket.short)));
+
+      const upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(bucket.short));
+
+      cards.push({
+        slug: bucket.slug, name: bucket.name, season: "International", flag: bucket.flag,
+        short: bucket.short, image: leagueImages.get(bucket.leagueId) || "", sport: "cricket",
+        accuracy: await getLeagueAccuracyPublic(bucket.slug),
+        recentMatches: selectCardRows(false, null, upcomingRow, rows, perLeagueLimit),
+      });
+    } catch (e) {
+      console.warn(`[Accuracy] league cards: international ${bucket.slug} failed:`, e.message);
+    }
+  }
+
+  cards.sort((a, b) => (orderMap.get(a.slug) ?? 0) - (orderMap.get(b.slug) ?? 0));
+  return cards;
+}
+
+async function getLeagueCardsPublic(limit = 5) {
+  const cacheKey = `accuracy:league-cards:${limit}`;
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+  const result = await computeLeagueCards(limit);
+  setCache(cacheKey, result, ACCURACY_TTL_S);
+  return result;
 }
 
 function toPercentage(t) {
@@ -243,5 +467,6 @@ module.exports = {
   computeGlobalAccuracy,
   getGlobalAccuracyPublic,
   getLeagueAccuracyPublic,
+  getLeagueCardsPublic,
   setOverride,
 };

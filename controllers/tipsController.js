@@ -188,4 +188,4 @@ async function getMatchTip(req, res) {
   }
 }
 
-module.exports = { getTipsList, getMatchTip };
+module.exports = { getTipsList, getMatchTip, getPersistentLightTip };

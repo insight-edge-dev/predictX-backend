@@ -46,4 +46,8 @@ router.put("/admin/home-sections/:key",    adminAuth, ctrl.setHomeSectionEnabled
 router.get("/admin/accuracy",      adminAuth, ctrl.listAccuracyAdmin);
 router.put("/admin/accuracy/:key", adminAuth, ctrl.setAccuracyOverride);
 
+router.get("/admin/league-cards",         adminAuth, ctrl.listLeagueCardSettingsAdmin);
+router.put("/admin/league-cards/reorder", adminAuth, ctrl.reorderLeagueCards);
+router.put("/admin/league-cards/:slug",   adminAuth, ctrl.setLeagueCardVisible);
+
 module.exports = router;

@@ -32,7 +32,7 @@ const intlService         = require("../services/internationalService");
 const adminDashboardService = require("../services/adminDashboardService");
 const accuracyService       = require("../services/accuracyService");
 const cloudinaryService    = require("../services/cloudinaryService");
-const { delCache, KEYS }   = require("../services/cacheService");
+const { delCache, KEYS, listEntries } = require("../services/cacheService");
 
 const BANNER_LINK_TYPES = ["none", "external", "match", "tip", "league_home", "app_section"];
 
@@ -679,10 +679,89 @@ async function setAccuracyOverride(req, res) {
 
   try {
     await accuracyService.setOverride(key, override === null ? null : Number(override));
+    invalidateLeagueCardsCache();
     return res.json({ key, override: override === null ? null : Number(override) });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
+}
+
+// ── League Cards (Discovery "PredictX Prediction" section) ──────
+
+function invalidateLeagueCardsCache() {
+  listEntries()
+    .filter(e => e.key.startsWith("accuracy:league-cards:"))
+    .forEach(e => delCache(e.key));
+}
+
+function allLeagueCardSlugs() {
+  return [
+    ...Object.values(LEAGUES).map(l => ({ slug: l.slug, name: l.name, short: l.short, flag: l.flag, sport: "cricket" })),
+    ...Object.values(FOOTBALL_LEAGUES).map(l => ({ slug: l.slug, name: l.name, short: l.short, flag: l.flag, sport: "football" })),
+    ...Object.values(intlService.INTERNATIONAL_LEAGUES).map(b => ({ slug: b.slug, name: b.name, short: b.short, flag: b.flag, sport: "cricket" })),
+  ];
+}
+
+async function listLeagueCardSettingsAdmin(req, res) {
+  try {
+    const { data: settings, error } = await supabase.from("league_card_settings").select("*");
+    if (error) throw new Error(error.message);
+    const settingsMap = new Map((settings ?? []).map(s => [s.slug, s]));
+
+    const cards = allLeagueCardSlugs().map((l, i) => {
+      const s = settingsMap.get(l.slug);
+      return {
+        ...l,
+        is_visible:    s ? s.is_visible : true,
+        display_order: s ? s.display_order : i,
+      };
+    }).sort((a, b) => a.display_order - b.display_order);
+
+    return res.json({ cards });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function setLeagueCardVisible(req, res) {
+  const { slug } = req.params;
+  const { visible } = req.body;
+  if (typeof visible !== "boolean") {
+    return res.status(400).json({ error: "visible must be a boolean" });
+  }
+
+  // Preserve display_order explicitly — an upsert that omits it would let a
+  // brand-new row fall back to the table's DEFAULT 0 on this card's first
+  // ever toggle, jumping it to the front unintentionally.
+  const { data: existing } = await supabase
+    .from("league_card_settings").select("display_order").eq("slug", slug).single();
+  const fallbackOrder = allLeagueCardSlugs().findIndex(l => l.slug === slug);
+  const displayOrder = existing ? existing.display_order : Math.max(fallbackOrder, 0);
+
+  const { error } = await supabase
+    .from("league_card_settings")
+    .upsert({ slug, is_visible: visible, display_order: displayOrder, updated_at: new Date().toISOString() });
+
+  if (error) return res.status(500).json({ error: error.message });
+  invalidateLeagueCardsCache();
+  return res.json({ slug, visible });
+}
+
+async function reorderLeagueCards(req, res) {
+  const { order } = req.body;
+  if (!Array.isArray(order) || order.length === 0) {
+    return res.status(400).json({ error: "order must be a non-empty array of league slugs" });
+  }
+
+  for (let i = 0; i < order.length; i++) {
+    const { error } = await supabase
+      .from("league_card_settings")
+      .upsert({ slug: order[i], display_order: i, updated_at: new Date().toISOString() });
+    if (error) return res.status(500).json({ error: error.message });
+  }
+
+  invalidateLeagueCardsCache();
+  return res.json({ success: true });
 }
 
 module.exports = {
@@ -717,4 +796,7 @@ module.exports = {
   reorderHomeSections,
   listAccuracyAdmin,
   setAccuracyOverride,
+  listLeagueCardSettingsAdmin,
+  setLeagueCardVisible,
+  reorderLeagueCards,
 };
