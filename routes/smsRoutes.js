@@ -34,8 +34,7 @@ router.post("/auth/sms-hook", async (req, res) => {
   const digits = phone.replace(/\D/g, "");
   const mobile = digits.length > 10 ? digits.slice(-10) : digits;
 
-  const hashSuffix = process.env.ANDROID_APP_HASH ? `\n${process.env.ANDROID_APP_HASH}` : '';
-  const msg = `Dear User, your OTP for Paco Innovations LLP login is ${otp}. OTP valid for 10 minutes. Please do not share it with anyone.${hashSuffix}`;
+  const msg = `Dear User, your OTP for Paco Innovations LLP login is ${otp}. OTP valid for 10 minutes. Please do not share it with anyone.`;
 
   try {
     const { data } = await axios.get(SMS_URL, {
