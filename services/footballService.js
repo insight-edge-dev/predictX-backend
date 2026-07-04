@@ -212,6 +212,8 @@ async function refreshLiveScores() {
  * Never calls the live API (that's the scheduled job's job — see refreshFromAPI).
  * Falls back to the hardcoded fixture schedule until the first scheduled sync lands.
  */
+const FIXTURES_STALE_THRESHOLD_MS = 4 * 60 * 60 * 1000; // 4h — trigger bg refresh if DB data is older
+
 async function getWCFixtures() {
   const cacheKey = KEYS.FOOTBALL_FIXTURES;
 
@@ -219,11 +221,17 @@ async function getWCFixtures() {
   const hot = getCache(cacheKey);
   if (hot && hot.length > 0 && !hot[0]?._hardcoded) return hot;
 
-  // Treat Supabase as the long-lived source of truth — the scheduler keeps it
-  // fresh, so we never want a stale-data check here to fall through to the API.
-  const warm = await db.getCachedData(cacheKey, Infinity);
+  // Read from Supabase — always use whatever is there (never let stale data fall
+  // through to hardcoded fixtures), but trigger a background refresh if the data
+  // is older than FIXTURES_STALE_THRESHOLD_MS so the scheduler's 8h window doesn't
+  // leave the app showing days-old results (e.g. on Render after a restart).
+  const { data: warm, ageMs } = await db.getCachedDataWithAge(cacheKey);
   if (warm && warm.length > 0 && !warm[0]?._hardcoded) {
     setCache(cacheKey, warm, TTL.FOOTBALL_FIXTURES);
+    if (ageMs > FIXTURES_STALE_THRESHOLD_MS) {
+      console.log(`[Football] DB fixtures are ${Math.round(ageMs / 3600000)}h old — triggering background refresh`);
+      refreshFromAPI().catch(e => console.warn("[Football] background refresh failed:", e.message));
+    }
     return warm;
   }
 

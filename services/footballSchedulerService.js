@@ -24,7 +24,7 @@
 const footballService = require("./footballService");
 const jobTracker      = require("./jobTracker");
 
-const FULL_REFRESH_INTERVAL_MS = 8 * 60 * 60 * 1000; // 24h / 3 = 8h
+const FULL_REFRESH_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3h — shorter during active tournament
 const LIVE_POLL_INTERVAL_MS    = 60 * 1000;          // 60s
 const BOOT_DELAY_MS            = 15 * 1000;          // let the server finish booting first
 

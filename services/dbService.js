@@ -366,6 +366,25 @@ async function setCachedData(key, payload) {
   console.log(`[DB] CACHE SET ${key}`);
 }
 
+// Like getCachedData but never treats data as stale — returns { data, ageMs } so
+// callers can decide whether to trigger a background refresh without a second DB round-trip.
+async function getCachedDataWithAge(key) {
+  try {
+    const { data, error } = await supabase
+      .from("series")
+      .select("data, updated_at")
+      .eq("id", key)
+      .single();
+    if (error || !data) return { data: null, ageMs: Infinity };
+    const ageMs = Date.now() - new Date(data.updated_at).getTime();
+    console.log(`[DB] CACHE HIT ${key} — ${Math.round(ageMs / 60_000)}m old`);
+    return { data: data.data, ageMs };
+  } catch (e) {
+    console.warn(`[DB] getCachedDataWithAge(${key}) failed:`, e.message);
+    return { data: null, ageMs: Infinity };
+  }
+}
+
 // ── Bulk delete helpers (admin / reset) ──────────────────────
 
 async function deleteAllMatches() {
@@ -431,6 +450,7 @@ module.exports = {
   deleteFixtures,
   getCachedData,
   setCachedData,
+  getCachedDataWithAge,
   getCachedDataByPrefix,
   deleteAllMatches,
   deleteAllSquads,
