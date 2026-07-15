@@ -1,0 +1,41 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Deploy Backend
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+
+          script: |
+            set -e
+
+            echo "🚀 Deploying PredictX Backend..."
+
+            cd /var/www/predictx/backend/predictX-backend
+
+            git fetch origin
+            git reset --hard origin/main
+
+            npm ci || npm install
+
+            pm2 restart predictx-api --update-env
+
+            sleep 5
+
+            curl -f https://api.predictxsports.com/health
+
+            echo "✅ Backend deployed successfully"
