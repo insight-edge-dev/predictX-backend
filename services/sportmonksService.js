@@ -263,6 +263,18 @@ async function getSeasonForLeague(leagueId) {
   return Array.isArray(data) ? data[0] ?? null : null;
 }
 
+// Returns the N most-recent seasons for a league, newest first.
+// Used by internationalService to fall back to the previous season when
+// Sportsmonks creates an empty new-year container before populating it.
+async function getSeasonsForLeague(leagueId, count = 2) {
+  const data = await _fetch("/seasons", {
+    "filter[league_id]": leagueId,
+    sort:                "-id",
+    per_page:            count,
+  });
+  return Array.isArray(data) ? data.slice(0, count) : [];
+}
+
 /**
  * All stages for a season (needed to find regular-season stage_id).
  */
@@ -354,6 +366,18 @@ async function getStandingsByStageIds(stageId, playoffId) {
   return { regular: regular ?? [], playoff: playoff ?? [] };
 }
 
+/**
+ * Fixtures whose starting_at falls within [from, to] (YYYY-MM-DD strings).
+ * Used to auto-detect which leagues are currently active.
+ */
+async function getFixturesInDateRange(from, to, page = 1) {
+  return _fetch("/fixtures", {
+    "filter[starts_between]": `${from},${to}`,
+    per_page: 100,
+    page,
+  });
+}
+
 // ── Exports ───────────────────────────────────────────────────
 
 module.exports = {
@@ -377,6 +401,8 @@ module.exports = {
   getAllLeagues,
   getRecentSeasons,
   getSeasonForLeague,
+  getSeasonsForLeague,
+  getFixturesInDateRange,
   getSeasonStages,
   getPlayer,
   searchPlayers,

@@ -19,6 +19,21 @@ const router = express.Router();
 const SMS_URL = "https://jskbulkmarketing.in/app/smsapi/index.php";
 
 router.post("/auth/sms-hook", async (req, res) => {
+  // Always require the webhook secret. Set SMS_HOOK_SECRET in backend .env,
+  // then add the same value as "Authorization: Bearer <secret>" in Supabase
+  // Dashboard → Auth → Providers → Phone → Custom SMS → HTTP Headers.
+  const hookSecret = process.env.SMS_HOOK_SECRET;
+  if (!hookSecret) {
+    console.error("[SMSHook] SMS_HOOK_SECRET env var not set — rejecting all requests");
+    return res.status(503).json({ error: "Webhook not configured" });
+  }
+  const authHeader = req.headers["authorization"] ?? "";
+  const provided   = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  if (provided !== hookSecret) {
+    console.warn("[SMSHook] Unauthorized request — bad or missing secret");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
   // Supabase can send two different shapes — handle both
   const phone = req.body.phone || req.body.user?.phone;
   const otp   = req.body.otp   || req.body.sms?.otp;

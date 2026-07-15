@@ -139,6 +139,7 @@ function normalizeFixture(raw) {
       away:   isPlayed ? (ft.away ?? null) : null,
       htHome: isPlayed ? (ht.home ?? null) : null,
       htAway: isPlayed ? (ht.away ?? null) : null,
+      winner: raw.score?.winner ?? null,
     },
     status,
     statusText,

@@ -2,8 +2,23 @@ const express    = require("express");
 const adminAuth  = require("../middleware/adminAuth");
 const upload     = require("../middleware/upload");
 const ctrl       = require("../controllers/adminController");
+const resolver   = require("../services/resolverService");
 
 const router = express.Router();
+
+// Public login endpoint — validates credentials server-side and returns the
+// admin key so the frontend never needs VITE_ADMIN_KEY in its bundle.
+router.post("/admin/login", (req, res) => {
+  const { user, pass } = req.body ?? {};
+  if (
+    user && pass &&
+    user === process.env.ADMIN_USER &&
+    pass === process.env.ADMIN_PASS
+  ) {
+    return res.json({ token: process.env.ADMIN_KEY });
+  }
+  return res.status(401).json({ error: "Invalid credentials" });
+});
 
 // Each route has adminAuth inline — avoids blocking non-admin routes
 router.post  ("/admin/notifications",          adminAuth, ctrl.createNotification);
@@ -16,6 +31,8 @@ router.put   ("/admin/expert-predictions/:id", adminAuth, ctrl.updateExpertPredi
 router.delete("/admin/expert-predictions/:id", adminAuth, ctrl.deleteExpertPrediction);
 
 router.get("/admin/matches", adminAuth, ctrl.getUpcomingMatchesPicker);
+
+router.post("/admin/push-broadcast", adminAuth, ctrl.sendPushBroadcast);
 
 router.get("/admin/overview", adminAuth, ctrl.getOverview);
 router.get("/admin/monitor",  adminAuth, ctrl.getMatchMonitor);
@@ -49,5 +66,36 @@ router.put("/admin/accuracy/:key", adminAuth, ctrl.setAccuracyOverride);
 router.get("/admin/league-cards",         adminAuth, ctrl.listLeagueCardSettingsAdmin);
 router.put("/admin/league-cards/reorder", adminAuth, ctrl.reorderLeagueCards);
 router.put("/admin/league-cards/:slug",   adminAuth, ctrl.setLeagueCardVisible);
+
+router.get   ("/admin/comments",     adminAuth, ctrl.listCommentsAdmin);
+router.delete("/admin/comments/:id", adminAuth, ctrl.deleteCommentAdmin);
+
+// ── Prediction resolution ──────────────────────────────────────
+// POST /api/admin/resolve-match          → manual single-match resolve
+// POST /api/admin/resolve-scan           → trigger the auto-scan now
+
+router.post("/admin/resolve-match", adminAuth, async (req, res) => {
+  const { matchId, winner } = req.body ?? {};
+  if (!matchId || !winner) {
+    return res.status(400).json({ error: "matchId and winner are required" });
+  }
+  try {
+    const result = await resolver.resolveMatch(matchId, winner);
+    return res.json({ success: true, ...result });
+  } catch (e) {
+    console.error("[Admin] resolve-match error:", e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+router.post("/admin/resolve-scan", adminAuth, async (req, res) => {
+  try {
+    const resolved = await resolver.runAutoResolve();
+    return res.json({ success: true, resolved, message: resolved > 0 ? `Resolved ${resolved} prediction batch(es)` : "Scan complete — nothing new to resolve" });
+  } catch (e) {
+    console.error("[Admin] resolve-scan error:", e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 module.exports = router;

@@ -26,14 +26,9 @@ function headers() {
   };
 }
 
-/**
- * Image proxy URL served by our own backend.
- * The imageId comes from the story's coverImage.id field.
- * The actual fetch happens in the /api/img/news/:id route.
- */
 function newsImgUrl(imageId) {
   if (!imageId) return null;
-  return `/api/img/news/${imageId}`;   // resolved at runtime with base URL
+  return `https://static.cricbuzz.com/a/img/v1/i2/c${imageId}/i.jpg`;
 }
 
 function normalizeStory(story) {

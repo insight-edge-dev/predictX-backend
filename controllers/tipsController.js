@@ -2,13 +2,74 @@ const iplService     = require("../services/iplService");
 const leagueService  = require("../services/leagueService");
 const tipsService    = require("../services/tipsService");
 const genericTips    = require("../services/genericTipsService");
+const { getPersistentLightTip } = require("../services/lightTipService");
 const db             = require("../services/dbService");
 const { getCache, setCache, TTL } = require("../services/cacheService");
-const { getLeague }  = require("../config/leaguesConfig");
+const { getLeague, LEAGUES }  = require("../config/leaguesConfig");
 
 // Predictions are static (pre-match historical data) — never expire in DB.
 const PRED_TTL_DB  = 365 * 24 * 60 * 60_000; // 1 year
 const PRED_TTL_MEM = TTL.DAILY;               // 24 h in memory
+
+// Run async tasks with at most `limit` in flight at once.
+async function withConcurrency(items, fn, limit = 5) {
+  const results = [];
+  for (let i = 0; i < items.length; i += limit) {
+    const batch = items.slice(i, i + limit);
+    const chunk = await Promise.all(batch.map(fn));
+    results.push(...chunk);
+  }
+  return results;
+}
+
+// ── Prediction bulk-prime ─────────────────────────────────────
+// On the first tips request each server lifecycle, pull ALL stored
+// predictions from Supabase in ONE query and load them into NodeCache.
+// Every subsequent match lookup is a pure in-memory hit — no DB at all.
+// This is the key fix: N individual DB queries → 1 bulk query per lifecycle.
+
+let _predsCachePrimed = false;
+const _predsPrimeInFlight = { promise: null };
+
+async function primePredictionsCache() {
+  if (_predsCachePrimed) return;
+
+  // Single-flight: if priming is already in progress, wait for it.
+  if (_predsPrimeInFlight.promise) {
+    return _predsPrimeInFlight.promise;
+  }
+
+  _predsPrimeInFlight.promise = (async () => {
+    try {
+      const dbMap = await db.getCachedDataByPrefix("pred:light:");
+      let primed = 0;
+      for (const [key, data] of dbMap) {
+        const matchId = key.replace("pred:light:", "");
+        const memKey  = `tips:light:${matchId}`;
+        if (!getCache(memKey)) {
+          setCache(memKey, data, PRED_TTL_MEM);
+          primed++;
+        }
+      }
+      _predsCachePrimed = true;
+      console.log(`[Tips] primed ${primed}/${dbMap.size} prediction(s) into memory (1 DB query)`);
+    } catch (e) {
+      // Allow retry on next request
+      console.warn("[Tips] prediction prime failed:", e.message);
+    } finally {
+      _predsPrimeInFlight.promise = null;
+    }
+  })();
+
+  return _predsPrimeInFlight.promise;
+}
+
+// ── Single-flight map ─────────────────────────────────────────
+// If 100 users hit a cold tips cache simultaneously, only 1 computation
+// runs per league. The other 99 await that same Promise instead of each
+// starting their own (which would multiply the Supabase load by 100×).
+
+const _inFlightLeagues = new Map();
 
 // ── League resolution ─────────────────────────────────────────
 // `league` query param selects the league; defaults to IPL so existing
@@ -22,90 +83,121 @@ function resolveLeagueSlug(req) {
 // ── Persistent lightweight tip ────────────────────────────────
 // Check memory → DB → generate.  Writes to DB on first generation
 // so the prediction survives server restarts forever.
+// ── Core per-league computation ───────────────────────────────
+// Returns { matches: MatchWithTip[] } from cache or by generating predictions.
 //
-// `ctx.isIPL === true`  → uses tipsService (7-factor IPL model, unchanged)
-// `ctx.isIPL === false` → uses genericTips (current-season model for other leagues)
+// Scaling strategy:
+//   1. NodeCache hit → return instantly (no DB)
+//   2. Single-flight → 100 concurrent cold requests = 1 actual computation
+//   3. Bulk prime → loads ALL existing predictions in 1 DB query before processing
+//   4. Only truly-new matches (no DB record yet) generate predictions (rare)
 
-async function getPersistentLightTip(match, ctx) {
-  const memKey = `tips:light:${match.id}`;
-  const dbKey  = `pred:light:${match.id}`;
+async function _doComputeLeague(slug) {
+  const isIPL    = slug === "ipl";
+  const cacheKey = isIPL ? "tips:list" : `tips:list:${slug}`;
 
-  // 1. Memory cache (fastest)
-  const mem = getCache(memKey);
-  if (mem) return mem;
+  // Re-check after acquiring single-flight (another request may have warmed it)
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
 
-  // 2. Supabase DB (survives restarts)
-  const stored = await db.getCachedData(dbKey, PRED_TTL_DB);
-  if (stored) {
-    setCache(memKey, stored, PRED_TTL_MEM);
-    return stored;
+  // Bulk-load ALL known predictions into NodeCache with ONE Supabase query.
+  // After this, every match lookup below is a pure memory hit.
+  await primePredictionsCache();
+
+  let matches, ctx;
+  if (isIPL) {
+    matches = await iplService.getIPLMatches();
+    ctx = { isIPL: true };
+  } else {
+    const league = getLeague(slug);
+    if (!league || league.sport !== "cricket") {
+      const empty = { matches: [] };
+      setCache(cacheKey, empty, 30 * 60);
+      return empty;
+    }
+    const [leagueMatches, table] = await Promise.all([
+      leagueService.getLeagueMatches(league),
+      leagueService.getLeagueTable(league),
+    ]);
+    matches = leagueMatches;
+    ctx = { isIPL: false, table, completed: matches.completed, slug };
   }
 
-  // 3. Generate and persist
-  const tip = ctx.isIPL
-    ? await tipsService.getLightweightTip(match)
-    : await genericTips.getLightweightTip(match, ctx.table, ctx.completed, ctx.slug);
+  const tippable = [...matches.live, ...matches.upcoming, ...matches.completed];
 
-  if (tip) {
-    setCache(memKey, tip, PRED_TTL_MEM);
-    void db.setCachedData(dbKey, tip);  // fire-and-forget write to DB
-    console.log(`[Tips] stored prediction for match ${match.id}`);
-  }
-  return tip;
+  // After the bulk prime, most matches hit NodeCache immediately.
+  // Only truly new matches (no stored prediction yet) hit the DB/generator.
+  // Concurrency limit of 3 on generation guards the connection pool for those.
+  const withTips = await withConcurrency(tippable, async (m) => {
+    try {
+      const tip = await getPersistentLightTip(m, ctx);
+      return { ...m, tip: tip ?? null };
+    } catch {
+      return { ...m, tip: null };
+    }
+  }, 3);
+
+  const payload = { matches: withTips };
+  setCache(cacheKey, payload, 30 * 60);
+  return payload;
+}
+
+async function computeTipsForLeague(slug) {
+  const cacheKey = slug === "ipl" ? "tips:list" : `tips:list:${slug}`;
+
+  // Fast path: NodeCache hit — no async work at all
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  // Single-flight: if already computing, return the same Promise
+  if (_inFlightLeagues.has(slug)) return _inFlightLeagues.get(slug);
+
+  const promise = _doComputeLeague(slug).finally(() => _inFlightLeagues.delete(slug));
+  _inFlightLeagues.set(slug, promise);
+  return promise;
 }
 
 // ── GET /api/tips?league=<slug> ───────────────────────────────
-// Returns live + upcoming + recent completed matches with predictions.
+// Returns live + upcoming + completed matches with predictions.
 // `league` defaults to IPL (unchanged behaviour for existing callers).
 
 async function getTipsList(req, res) {
-  const slug  = resolveLeagueSlug(req);
-  const isIPL = slug === "ipl";
-  const cacheKey = isIPL ? "tips:list" : `tips:list:${slug}`;
-
+  const slug = resolveLeagueSlug(req);
   try {
-    const cached = getCache(cacheKey);
-    if (cached) return res.json(cached);
-
-    let matches, ctx;
-    if (isIPL) {
-      matches = await iplService.getIPLMatches();
-      ctx = { isIPL: true };
-    } else {
-      const league = getLeague(slug);
-      if (!league || league.sport !== "cricket") {
-        const empty = { matches: [] };
-        setCache(cacheKey, empty, 30 * 60_000);
-        return res.json(empty);
-      }
-      const [leagueMatches, table] = await Promise.all([
-        leagueService.getLeagueMatches(league),
-        leagueService.getLeagueTable(league),
-      ]);
-      matches = leagueMatches;
-      ctx = { isIPL: false, table, completed: matches.completed, slug };
-    }
-
-    // Include ALL completed matches so prediction badges show for the full season
-    const tippable = [...matches.live, ...matches.upcoming, ...matches.completed];
-
-    const withTips = await Promise.all(
-      tippable.map(async (m) => {
-        try {
-          const tip = await getPersistentLightTip(m, ctx);
-          return { ...m, tip: tip ?? null };
-        } catch {
-          return { ...m, tip: null };
-        }
-      })
-    );
-
-    const payload = { matches: withTips };
-    setCache(cacheKey, payload, 30 * 60_000);
+    const payload = await computeTipsForLeague(slug);
     return res.json(payload);
   } catch (e) {
     console.error("[Tips] getTipsList error:", e.message);
     return res.status(500).json({ matches: [] });
+  }
+}
+
+// ── GET /api/tips/bundle ──────────────────────────────────────
+// Returns tips for all active (2026-season) cricket leagues in one request.
+// Leagues are processed 2-at-a-time (each league already limits to 5 concurrent
+// DB queries) so cold-start peak load stays within the free-tier connection pool.
+// Warm requests (NodeCache hits) run instantly regardless of concurrency.
+
+async function getTipsBundle(_req, res) {
+  try {
+    const slugs = Object.values(LEAGUES)
+      .filter(l => l.sport === "cricket")
+      .map(l => l.slug);
+
+    // Run 2 leagues at a time (each uses up to 5 DB connections → max 10 total).
+    const results = await withConcurrency(
+      slugs,
+      slug => computeTipsForLeague(slug).catch(() => ({ matches: [] })),
+      2
+    );
+
+    const bundle = {};
+    slugs.forEach((slug, i) => { bundle[slug] = results[i]; });
+
+    return res.json(bundle);
+  } catch (e) {
+    console.error("[Tips] getTipsBundle error:", e.message);
+    return res.status(500).json({});
   }
 }
 
@@ -188,4 +280,4 @@ async function getMatchTip(req, res) {
   }
 }
 
-module.exports = { getTipsList, getMatchTip, getPersistentLightTip };
+module.exports = { getTipsList, getMatchTip, getPersistentLightTip, computeTipsForLeague, getTipsBundle };

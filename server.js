@@ -1,8 +1,10 @@
 require("dotenv").config();
 
-const http    = require("http");
-const express = require("express");
-const cors    = require("cors");
+const http        = require("http");
+const express     = require("express");
+const cors        = require("cors");
+const compression = require("compression");
+const rateLimit   = require("express-rate-limit");
 
 const footballRoutes   = require("./routes/footballRoutes");
 const matchRoutes      = require("./routes/matchRoutes");
@@ -21,6 +23,7 @@ const smsRoutes        = require("./routes/smsRoutes");
 const authRoutes       = require("./routes/authRoutes");
 const venueRoutes      = require("./routes/venueRoutes");
 const internationalRoutes = require("./routes/internationalRoutes");
+const communityRoutes     = require("./routes/communityRoutes");
 
 const { getStats, flushCache }    = require("./services/cacheService");
 const { resetIPLCache, getIPLFixtures } = require("./services/iplService");
@@ -29,12 +32,50 @@ const wsService                   = require("./services/wsService");
 const footballService             = require("./services/footballService");
 const footballScheduler           = require("./services/footballSchedulerService");
 const predictionScheduler         = require("./services/predictionSchedulerService");
+const resolverService             = require("./services/resolverService");
+const pushScheduler               = require("./services/pushSchedulerService");
 
 const app    = express();
 const server = http.createServer(app);
 const PORT   = process.env.PORT || 5000;
 
 // ── Middleware ────────────────────────────────────────────────
+
+app.use(compression());
+
+// ── Rate limiting ─────────────────────────────────────────────
+// General API: 120 req/min per IP (2/s burst) — covers normal mobile usage.
+// Auth endpoints: 10 req/min per IP — prevents OTP brute-force.
+// Admin endpoints: 30 req/min per IP — prevents admin-key brute-force.
+
+const apiLimiter = rateLimit({
+  windowMs:        60_000,
+  max:             120,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:         { error: "Too many requests, please slow down." },
+});
+
+const adminLimiter = rateLimit({
+  windowMs:        60_000,
+  max:             30,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:         { error: "Too many admin requests, please slow down." },
+});
+
+const authLimiter = rateLimit({
+  windowMs:        60_000,
+  max:             10,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message:         { error: "Too many auth attempts, please wait a minute." },
+});
+
+app.use("/api", apiLimiter);
+app.use("/api/admin", adminLimiter);
+app.use("/api/auth/send-otp",   authLimiter);
+app.use("/api/auth/verify-otp", authLimiter);
 
 const allowedOrigins = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(",").map(o => o.trim())
@@ -73,6 +114,7 @@ app.use("/api", playerRoutes);
 app.use("/api", userRoutes);
 app.use("/api", venueRoutes);
 app.use("/api", internationalRoutes);
+app.use("/api", communityRoutes);
 
 // ── Health check ──────────────────────────────────────────────
 
@@ -173,7 +215,7 @@ app.use((err, _req, res, _next) => {
 // ── Start ─────────────────────────────────────────────────────
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[Server] IPL IQ backend listening on 0.0.0.0:${PORT}`);
+  console.log(`[Server] PredictX backend listening on 0.0.0.0:${PORT}`);
   console.log(`[Server] SPORTMONKS_API_KEY: ${process.env.SPORTMONKS_API_KEY ? process.env.SPORTMONKS_API_KEY.slice(0, 8) + "…" : "MISSING"}`);
   console.log(`[Server] CRICBUZZ_API_KEY:   ${process.env.CRICBUZZ_API_KEY   ? process.env.CRICBUZZ_API_KEY.slice(0, 8)   + "…" : "MISSING (news/rankings degraded)"}`);
   console.log(`[Server] SUPABASE_URL:       ${process.env.SUPABASE_URL || "MISSING"}`);
@@ -182,4 +224,51 @@ server.listen(PORT, "0.0.0.0", () => {
   wsService.init(server);
   footballScheduler.start();
   predictionScheduler.start();
+  resolverService.startResolver();
+  pushScheduler.startScheduler();
+
+  // Pre-warm expensive caches so the first app open hits memory, not live computation.
+  // Bundle warming also warms leagueCards, cricket matches, intl, football and news in one shot.
+  setTimeout(async () => {
+    try {
+      const homeRouteModule = require("./routes/homeRoutes");
+      // Trigger bundle computation directly via the service layer
+      const { LEAGUES } = require("./config/leaguesConfig");
+      const leagueSvc   = require("./services/leagueService");
+      const footballSvc = require("./services/footballService");
+      const intlSvc     = require("./services/internationalService");
+      const newsSvc     = require("./services/newsService");
+      const { setCache } = require("./services/cacheService");
+
+      const cricketLeagues = Object.values(LEAGUES);
+      const [cricketResults, football, intlSeries, intlSchedule, news] =
+        await Promise.all([
+          Promise.all(cricketLeagues.map(l => leagueSvc.getLeagueMatches(l).then(d => ({ slug: l.slug, ...d })).catch(() => ({ slug: l.slug, live: [], upcoming: [], completed: [] })))),
+          footballSvc.getMatches().catch(() => ({ live: [], upcoming: [], completed: [] })),
+          intlSvc.getSeriesList().catch(() => []),
+          intlSvc.getScheduleFixtures(7).catch(() => ({ live: [], today: [], upcoming: [] })),
+          newsSvc.fetchCricketNews().catch(() => []),
+        ]);
+
+      const matches = {};
+      for (const { slug, live, upcoming, completed } of cricketResults) {
+        matches[slug] = { live: live ?? [], upcoming: upcoming ?? [], completed: completed ?? [] };
+      }
+      // leagueCards is intentionally excluded — computing it during startup warm fires
+      // 16+ concurrent Supabase queries alongside fixture fetches, exhausting the
+      // free-tier connection pool (60 conns) and causing getCachedDataByPrefix("pred:light:")
+      // to return an empty Map. That empty result then caches for 1h, hiding real data.
+      // Discovery fetches leagueCards separately via /api/home/league-cards, which runs
+      // after the connection pool has settled.
+      setCache("home:bundle:v1", { matches, football, intlSeries, intlSchedule, leagueCards: [], news }, 30);
+      console.log(`[Warm] home bundle ready (${cricketResults.length} leagues, leagueCards fetched lazily)`);
+    } catch (e) {
+      console.warn("[Warm] home bundle failed:", e.message);
+    }
+  }, 3000);
+
+  // Tips bundle is NOT warmed at startup — each league processes 30-100+
+  // completed matches against Supabase. Warming all leagues simultaneously
+  // exhausts the free-tier connection pool (60 conns). Tips cache fills
+  // naturally as users visit the Tips tab (30-min NodeCache TTL keeps it warm).
 });

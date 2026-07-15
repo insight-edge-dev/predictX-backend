@@ -15,14 +15,6 @@ const cacheService = require("./cacheService");
 const jobTracker = require("./jobTracker");
 const sm = require("./sportmonksService");
 
-const STARTED_BUFFER_MS = 4 * 60 * 60 * 1000; // mirrors internationalService
-
-function effectiveIntlStatus(m) {
-  if (m.status === "live") return "live";
-  const startedInPast = m.date && (Date.now() - new Date(m.date).getTime()) > STARTED_BUFFER_MS;
-  if (m.status === "completed" || startedInPast) return "completed";
-  return "upcoming";
-}
 
 // ── Match monitor: per-league counts + live-match data-quality flags ──
 
@@ -81,7 +73,7 @@ async function getMatchMonitor() {
       const fixtures = await internationalService.getBucketFixtures(bucket);
       let liveCount = 0, upcomingCount = 0, completedCount = 0;
       for (const m of fixtures) {
-        const st = effectiveIntlStatus(m);
+        const st = internationalService.effectiveStatus(m);
         if (st === "live") {
           liveCount++;
           live.push({

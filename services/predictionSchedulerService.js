@@ -52,6 +52,10 @@ async function ensureStored(match, table, completed, slug) {
   }
 }
 
+// Process matches in parallel batches to speed up DB writes while staying
+// within Supabase free tier's connection limit (~60 PG connections via PgBouncer).
+const MATCH_BATCH_SIZE = 5;
+
 async function refreshLeague(slug) {
   const league = LEAGUES[slug];
   if (!league || slug === "ipl") return;
@@ -73,8 +77,11 @@ async function refreshLeague(slug) {
     if (tippable.length === 0) return;
 
     console.log(`[PredictionScheduler] ${slug}: ensuring PredictX picks for ${tippable.length} matches`);
-    for (const match of tippable) {
-      await ensureStored(match, table, matches.completed, slug);
+    for (let i = 0; i < tippable.length; i += MATCH_BATCH_SIZE) {
+      await Promise.all(
+        tippable.slice(i, i + MATCH_BATCH_SIZE)
+          .map(match => ensureStored(match, table, matches.completed, slug)),
+      );
     }
   } catch (e) {
     console.warn(`[PredictionScheduler] ${slug} refresh failed —`, e.message);
@@ -84,10 +91,11 @@ async function refreshLeague(slug) {
 async function runRefresh() {
   console.log("[PredictionScheduler] running scheduled PredictX picks refresh…");
   const slugs = Object.keys(LEAGUES).filter(s => s !== "ipl");
-  for (const slug of slugs) {
-    await refreshLeague(slug);
-  }
+  // Leagues are independent — run all in parallel, each processes its own matches
+  await Promise.all(slugs.map(slug => refreshLeague(slug)));
   console.log("[PredictionScheduler] refresh complete");
+  // Prune stale series-table rows on every cycle (news:detail >7d, pred >90d)
+  void db.cleanupStaleSeriesRows();
 }
 
 /**

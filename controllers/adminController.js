@@ -579,7 +579,7 @@ async function setLeaguePriority(req, res) {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  delCache("all_leagues_dynamic");
+  delCache("all_leagues_raw");
   return res.json({ slug, priority: Number(priority) });
 }
 
@@ -764,6 +764,52 @@ async function reorderLeagueCards(req, res) {
   return res.json({ success: true });
 }
 
+async function sendPushBroadcast(req, res) {
+  const { title, body, data } = req.body;
+  if (!title?.trim() || !body?.trim()) {
+    return res.status(400).json({ error: "title and body are required" });
+  }
+
+  try {
+    const { sendPushNotifications, getTokensForPref } = require("../services/pushService");
+    const tokens = await getTokensForPref("admin_broadcasts");
+
+    sendPushNotifications(tokens, title.trim(), body.trim(), data ?? {})
+      .catch(e => console.error("[Admin] push broadcast error:", e.message));
+
+    return res.json({ queued: tokens.length });
+  } catch (e) {
+    console.error("[Admin] sendPushBroadcast error:", e.message);
+    return res.status(500).json({ error: "Failed to send broadcast" });
+  }
+}
+
+const commentService = require("../services/commentService");
+
+async function listCommentsAdmin(req, res) {
+  try {
+    const { contextType, page } = req.query;
+    const result = await commentService.listCommentsAdmin({
+      contextType: contextType || null,
+      page: parseInt(page) || 1,
+    });
+    return res.json(result);
+  } catch (e) {
+    console.error("[Admin] listCommentsAdmin:", e.message);
+    return res.status(500).json({ error: "Failed to fetch comments" });
+  }
+}
+
+async function deleteCommentAdmin(req, res) {
+  try {
+    await commentService.deleteComment(req.params.id);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("[Admin] deleteCommentAdmin:", e.message);
+    return res.status(500).json({ error: "Failed to delete comment" });
+  }
+}
+
 module.exports = {
   createNotification,
   listNotificationsAdmin,
@@ -799,4 +845,7 @@ module.exports = {
   listLeagueCardSettingsAdmin,
   setLeagueCardVisible,
   reorderLeagueCards,
+  listCommentsAdmin,
+  deleteCommentAdmin,
+  sendPushBroadcast,
 };

@@ -16,7 +16,12 @@ const sm       = require("../services/sportmonksService");
 const { fetchCricketNews }  = require("../services/newsService");
 const { getCache, setCache, TTL } = require("../services/cacheService");
 const { getCachedData, setCachedData } = require("../services/dbService");
-const accuracyService = require("../services/accuracyService");
+const accuracyService       = require("../services/accuracyService");
+const leagueService         = require("../services/leagueService");
+const footballService       = require("../services/footballService");
+const internationalService  = require("../services/internationalService");
+const predSvc               = require("../services/userPredictionService");
+const { LEAGUES }           = require("../config/leaguesConfig");
 const supabase = require("../config/supabase");
 
 const router = express.Router();
@@ -24,7 +29,7 @@ const router = express.Router();
 const CRICBUZZ_HOST = "cricbuzz-cricket.p.rapidapi.com";
 const RANKINGS_TTL_S  = 48 * 60 * 60;      // 48h — preserve Cricbuzz quota
 const RANKINGS_TTL_MS = RANKINGS_TTL_S * 1000;
-const DB_RANKINGS_KEY = "home:rankings:v4"; // v4: Cricbuzz team rankings
+const DB_RANKINGS_KEY = "home:rankings:v5"; // v5: player faceImageId fix
 
 function cricbuzzHeaders() {
   return {
@@ -68,6 +73,10 @@ router.get("/home/rankings", async (_req, res) => {
       const results = await Promise.allSettled(calls);
 
       function mapPlayer(r) {
+        // faceImageId can be 0 (falsy) even when present — use strict null/undefined check
+        const faceId = (r.faceImageId != null && r.faceImageId !== 0)
+          ? r.faceImageId
+          : (r.imageId != null && r.imageId !== 0 ? r.imageId : null);
         return {
           id:      String(r.id),
           rank:    Number(r.rank),
@@ -76,8 +85,8 @@ router.get("/home/rankings", async (_req, res) => {
           rating:  Number(r.rating),
           points:  Number(r.points),
           trend:   r.trend || "Flat",
-          imageUrl: r.faceImageId
-            ? `https://cricbuzz-static.s3.amazonaws.com/media/img/oneline/${r.faceImageId}.jpg`
+          imageUrl: faceId
+            ? `https://cricbuzz-static.s3.amazonaws.com/media/img/oneline/${faceId}.jpg`
             : null,
         };
       }
@@ -95,7 +104,11 @@ router.get("/home/rankings", async (_req, res) => {
         };
       }
 
-      if (results[0].status === "fulfilled") batsmen  = (results[0].value.data?.rank ?? []).slice(0,10).map(mapPlayer);
+      if (results[0].status === "fulfilled") {
+        const raw = results[0].value.data?.rank ?? [];
+        if (raw[0]) console.log("[Rankings] batsman sample fields:", Object.keys(raw[0]), "faceImageId=", raw[0].faceImageId, "imageId=", raw[0].imageId);
+        batsmen = raw.slice(0, 10).map(mapPlayer);
+      }
       if (results[1].status === "fulfilled") bowlers   = (results[1].value.data?.rank ?? []).slice(0,10).map(mapPlayer);
       if (results[2].status === "fulfilled") t20Teams  = (results[2].value.data?.rank ?? []).slice(0,16).map(mapTeam);
       if (results[3].status === "fulfilled") odiTeams  = (results[3].value.data?.rank ?? []).slice(0,16).map(mapTeam);
@@ -295,42 +308,13 @@ router.get("/home/season-stats", async (_req, res) => {
 });
 
 // ── GET /api/img/news/:imageId ────────────────────────────────
+// Kept for backward compat (older cached API responses still point here).
+// New responses use the public CDN URL directly — no Node buffer needed.
 
-router.get("/img/news/:imageId", async (req, res) => {
+router.get("/img/news/:imageId", (req, res) => {
   const { imageId } = req.params;
   if (!/^\d+$/.test(imageId)) return res.status(400).end();
-
-  // Serve from memory cache if available (avoids repeat Cricbuzz API calls)
-  const cacheKey = `img:news:${imageId}`;
-  const cached = getCache(cacheKey);
-  if (cached) {
-    res.set("Content-Type", "image/jpeg");
-    res.set("Cache-Control", "public, max-age=86400");
-    return res.send(cached);
-  }
-
-  try {
-    // Try i2 (medium) first, fall back to i1 (small thumbnail)
-    let response;
-    try {
-      response = await axios.get(
-        `https://cricbuzz-cricket.p.rapidapi.com/img/v1/i2/c${imageId}/i.jpg`,
-        { headers: cricbuzzHeaders(), responseType: "arraybuffer", timeout: 8_000 },
-      );
-    } catch {
-      response = await axios.get(
-        `https://cricbuzz-cricket.p.rapidapi.com/img/v1/i1/c${imageId}/i.jpg`,
-        { headers: cricbuzzHeaders(), responseType: "arraybuffer", timeout: 8_000 },
-      );
-    }
-    const buf = Buffer.from(response.data);
-    setCache(cacheKey, buf, 24 * 60 * 60);
-    res.set("Content-Type", response.headers["content-type"] || "image/jpeg");
-    res.set("Cache-Control", "public, max-age=86400");
-    return res.send(buf);
-  } catch {
-    res.status(404).end();
-  }
+  res.redirect(302, `https://static.cricbuzz.com/a/img/v1/i2/c${imageId}/i.jpg`);
 });
 
 // ── GET /api/home/facts ───────────────────────────────────────
@@ -417,6 +401,54 @@ router.get("/home/league-cards", async (req, res) => {
   } catch (e) {
     console.error("[Home] league-cards error:", e.message);
     return res.status(500).json({ cards: [] });
+  }
+});
+
+// ── GET /api/home/bundle ──────────────────────────────────────
+// Returns all Discovery-screen data in one request — eliminates the 15+
+// parallel HTTP/1.1 calls that queue behind the 6-connection limit on mobile.
+// Everything runs in parallel on the server (no connection limit here).
+
+router.get("/home/bundle", async (_req, res) => {
+  const cacheKey = "home:bundle:v1";
+  const cached = getCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const cricketLeagues = Object.values(LEAGUES);
+
+    const [cricketResults, football, intlSeries, intlSchedule, news] =
+      await Promise.all([
+        // All cricket league match data in parallel
+        Promise.all(
+          cricketLeagues.map(l =>
+            leagueService.getLeagueMatches(l)
+              .then(d => ({ slug: l.slug, ...d }))
+              .catch(() => ({ slug: l.slug, live: [], upcoming: [], completed: [] }))
+          )
+        ),
+        footballService.getMatches().catch(() => ({ live: [], upcoming: [], completed: [] })),
+        internationalService.getSeriesList().catch(() => []),
+        internationalService.getScheduleFixtures(7).catch(() => ({ live: [], today: [], upcoming: [] })),
+        fetchCricketNews().catch(() => []),
+      ]);
+
+    // Build slug → match data map
+    const matches = {};
+    for (const { slug, live, upcoming, completed } of cricketResults) {
+      matches[slug] = { live: live ?? [], upcoming: upcoming ?? [], completed: completed ?? [] };
+    }
+
+    // leagueCards are fetched separately by the app via /api/home/league-cards.
+    // Including them here runs under connection-pool pressure (16 parallel fixture fetches
+    // above) and causes getCachedDataByPrefix("pred:light:") to silently return an empty
+    // Map, poisoning the 1h accuracy cache with zeros.
+    const bundle = { matches, football, intlSeries, intlSchedule, leagueCards: [], news };
+    setCache(cacheKey, bundle, 30); // 30s — matches change frequently
+    return res.json(bundle);
+  } catch (e) {
+    console.error("[Home] bundle error:", e.message);
+    return res.status(500).json({ error: "Bundle failed" });
   }
 });
 

@@ -102,11 +102,6 @@ async function _fetchOne(table, column, value) {
   }
 }
 
-/**
- * Upserts a row into `table`.
- * `row` must be a plain object matching the table schema.
- * `conflictCol` is the column used for conflict detection.
- */
 async function _upsert(table, row, conflictCol) {
   try {
     const { error } = await supabase
@@ -116,6 +111,20 @@ async function _upsert(table, row, conflictCol) {
     if (error) console.warn(`[DB] ${table}.upsert failed:`, error.message);
   } catch (e) {
     console.warn(`[DB] ${table}.upsert error:`, e.message);
+  }
+}
+
+// Bulk variant — single HTTP round-trip for N rows.
+async function _upsertMany(table, rows, conflictCol) {
+  if (!rows.length) return;
+  try {
+    const { error } = await supabase
+      .from(table)
+      .upsert(rows, { onConflict: conflictCol });
+
+    if (error) console.warn(`[DB] ${table}.upsertMany failed:`, error.message);
+  } catch (e) {
+    console.warn(`[DB] ${table}.upsertMany error:`, e.message);
   }
 }
 
@@ -258,8 +267,11 @@ async function syncCricketReferenceData(fixtures) {
     if (f.venueId) venues.set(f.venueId, { id: f.venueId, name: f.venue || "" });
   }
 
-  for (const [id, data] of teams)  await saveCricketTeam(id, data);
-  for (const [id, data] of venues) await saveCricketVenue(id, data);
+  const now = NOW();
+  await Promise.all([
+    _upsertMany("cricket_teams",  [...teams.entries()].map(([id, data])  => ({ id, data, updated_at: now })),  "id"),
+    _upsertMany("cricket_venues", [...venues.entries()].map(([id, data]) => ({ id, data, updated_at: now })), "id"),
+  ]);
 
   if (teams.size || venues.size) {
     console.log(`[DB] cricket reference sync — ${teams.size} teams, ${venues.size} venues`);
@@ -303,12 +315,16 @@ async function syncFootballFixtures(fixtures) {
 
   const teams = new Map();
   for (const f of fixtures) {
-    await saveFootballFixture(f.id, f.status, f);
     for (const team of [f.homeTeam, f.awayTeam]) {
       if (team?.id) teams.set(team.id, team);
     }
   }
-  for (const [id, data] of teams) await saveFootballTeam(id, data);
+
+  const now = NOW();
+  await Promise.all([
+    _upsertMany("football_fixtures", fixtures.map(f => ({ id: f.id, status: f.status, data: f, updated_at: now })), "id"),
+    _upsertMany("football_teams",    [...teams.entries()].map(([code, data]) => ({ code, data, updated_at: now })),   "code"),
+  ]);
 
   console.log(`[DB] football fixture sync — ${fixtures.length} fixtures, ${teams.size} teams`);
 }
@@ -322,13 +338,17 @@ async function syncFootballGroups(groups) {
   if (entries.length === 0) return;
 
   const teams = new Map();
-  for (const [groupName, rows] of entries) {
-    await saveFootballGroup(groupName, rows);
+  for (const [, rows] of entries) {
     for (const row of rows) {
       if (row.team?.id) teams.set(row.team.id, row.team);
     }
   }
-  for (const [id, data] of teams) await saveFootballTeam(id, data);
+
+  const now = NOW();
+  await Promise.all([
+    _upsertMany("football_groups", entries.map(([group_name, data]) => ({ group_name, data, updated_at: now })), "group_name"),
+    _upsertMany("football_teams",  [...teams.entries()].map(([code, data]) => ({ code, data, updated_at: now })),   "code"),
+  ]);
 
   console.log(`[DB] football group sync — ${entries.length} groups, ${teams.size} teams`);
 }
@@ -436,6 +456,38 @@ async function deleteCachedByPrefix(prefix) {
   }
 }
 
+/**
+ * Prunes two categories of rows from the `series` table that accumulate
+ * without bound:
+ *
+ *   news:detail:*  — article detail rows (24h read-TTL, never auto-deleted).
+ *                    Pruned after 7 days: well beyond any user's session.
+ *
+ *   pred:light:* / pred:full:*  — one row per match per league, written
+ *                    every 8h by the prediction scheduler. Matches from
+ *                    prior seasons are never re-requested once completed,
+ *                    so rows older than 90 days are dead weight.
+ *
+ * Safe to run at any frequency — only deletes rows older than the threshold.
+ * Fire-and-forget: call as `void db.cleanupStaleSeriesRows()`.
+ */
+async function cleanupStaleSeriesRows() {
+  const sevenDaysAgo  = new Date(Date.now() -  7 * 24 * 60 * 60 * 1000).toISOString();
+  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+
+  try {
+    const [newsRes, predRes] = await Promise.all([
+      supabase.from("series").delete().like("id", "news:detail:%").lt("updated_at", sevenDaysAgo),
+      supabase.from("series").delete().like("id", "pred:%").lt("updated_at", ninetyDaysAgo),
+    ]);
+    if (newsRes.error) console.warn("[DB] cleanup news:detail failed:", newsRes.error.message);
+    if (predRes.error) console.warn("[DB] cleanup pred failed:",        predRes.error.message);
+    console.log("[DB] stale series cleanup done");
+  } catch (e) {
+    console.warn("[DB] cleanupStaleSeriesRows failed:", e.message);
+  }
+}
+
 module.exports = {
   getSeries,
   saveSeries,
@@ -452,6 +504,7 @@ module.exports = {
   setCachedData,
   getCachedDataWithAge,
   getCachedDataByPrefix,
+  cleanupStaleSeriesRows,
   deleteAllMatches,
   deleteAllSquads,
   deleteCachedByPrefix,

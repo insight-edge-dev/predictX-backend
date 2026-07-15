@@ -74,6 +74,13 @@ async function getLeagueFixtures(league) {
 
   console.log(`[League:${league.slug}] fixtures: ${fixtures.length} matches`);
   setCache(memKey, fixtures, TTL.FIXTURES);
+  // Seed per-fixture fallback cache — match-detail falls back to this when
+  // Sportsmonks /fixtures/:id returns null (e.g. new leagues with limited coverage).
+  fixtures.forEach(m => {
+    if (m.id && !getCache(`match:basic:${m.id}`)) {
+      setCache(`match:basic:${m.id}`, m, TTL.FIXTURES);
+    }
+  });
   void db.setCachedData(dbKey, fixtures);
   void db.syncCricketReferenceData(fixtures);
   return fixtures;
@@ -91,8 +98,23 @@ async function getLeagueLiveMatches(league) {
   const raw = await sm.getLivescores();
   if (!Array.isArray(raw)) return [];
 
+  // 12 h is the absolute ceiling for any cricket format (inc. rain-delayed ODIs).
+  // If Sportsmonks' livescores feed keeps returning a match beyond this window
+  // it means their feed is stale — don't propagate the error to the app.
+  const MAX_LIVE_MS = 12 * 60 * 60 * 1000;
+
   const live = raw
-    .filter(f => seasonId && f.season_id === seasonId)
+    .filter(f => {
+      if (!seasonId || f.season_id !== seasonId) return false;
+      if (f.starting_at) {
+        const age = Date.now() - new Date(f.starting_at).getTime();
+        if (age > MAX_LIVE_MS) {
+          console.warn(`[League] dropping stale livescores entry for fixture ${f.id} (started ${Math.round(age / 3600000)}h ago)`);
+          return false;
+        }
+      }
+      return true;
+    })
     .map(f => normalizeFixture(f))
     .filter(Boolean)
     .map(m => ({
@@ -118,25 +140,25 @@ async function getLeagueMatches(league) {
     getLeagueLiveMatches(league),
   ]);
 
-  const liveIds    = new Set(live.map(m => m.id));
-  const liveList   = [...live];
-  const upcoming   = [];
-  const completed  = [];
-  const seen       = new Set();
-
-  // Only force-complete a fixture if it started 4+ hours ago AND it isn't live.
-  // 30 min was too aggressive — delayed/rain-affected matches got incorrectly completed.
-  // Matches saved in match_results (via WS) are handled separately with full data.
+  const liveIds           = new Set(live.map(m => m.id));
+  const liveList          = [...live];
+  const upcoming          = [];
+  const seen              = new Set();
   const STARTED_BUFFER_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+  // ── Pass 1: categorise fixtures ──────────────────────────────
+  // Collect completed fixtures first so we can bulk-fetch their results
+  // from Supabase in ONE query instead of N individual queries.
+
+  const completedFixtures = []; // { match, startedInPast }
 
   for (const m of fixtures) {
     if (seen.has(m.id)) continue;
     seen.add(m.id);
     if (liveIds.has(m.id)) continue;
 
-    const startedInPast  = m.date && (Date.now() - new Date(m.date).getTime()) > STARTED_BUFFER_MS;
+    const startedInPast   = m.date && (Date.now() - new Date(m.date).getTime()) > STARTED_BUFFER_MS;
     const hasStoredResult = !!getCache(`completed_match:${m.id}`);
-    // Force completed if: WS already saved a result (NodeCache hit) OR 4h past start time
     const effectiveStatus =
       (hasStoredResult || (startedInPast && m.status !== "completed"))
         ? "completed"
@@ -145,46 +167,61 @@ async function getLeagueMatches(league) {
     if (effectiveStatus === "live") {
       liveList.push(m);
     } else if (effectiveStatus === "completed") {
-      // Priority: 1) NodeCache  2) Supabase match_results  3) raw fixture (may have no scores)
-      const memCached = getCache(`completed_match:${m.id}`);
-      if (memCached) {
-        completed.push({ ...memCached, status: "completed", isCompleted: true });
-      } else {
-        // Push stale fixture immediately so the UI shows something
-        completed.push({ ...m, status: "completed", isCompleted: true });
-
-        // Background: load from Supabase then re-warm NodeCache
-        const lockKey = `loading_result:${m.id}`;
-        if (!getCache(lockKey)) {
-          setCache(lockKey, true, 30);
-          supabase.from("match_results")
-            .select("data")
-            .eq("match_id", String(m.id))
-            .single()
-            .then(({ data: row }) => {
-              if (row?.data) {
-                setCache(`completed_match:${m.id}`, { ...row.data, status: "completed", isCompleted: true }, 24 * 60 * 60);
-                delCache(KEYS.LEAGUE_FIXTURES(league.slug));
-                console.log(`[League] match ${m.id} result loaded from Supabase`);
-              } else if (startedInPast && !m.score1) {
-                // Not in Supabase yet — try Sportsmonks fixture detail
-                sm.getFixtureDetail(m.id).then(detail => {
-                  if (!detail) return;
-                  const updated = normalizeFixture(detail);
-                  if (updated?.score1) {
-                    setCache(`completed_match:${m.id}`, { ...updated, status: "completed", isCompleted: true }, 24 * 60 * 60);
-                    delCache(KEYS.LEAGUE_FIXTURES(league.slug));
-                  }
-                }).catch(() => {});
-              }
-            })
-            .catch(() => {});
-        }
-      }
+      completedFixtures.push({ match: m, startedInPast });
     } else {
       upcoming.push(m);
     }
   }
+
+  // ── Pass 2: bulk-load missing results (1 query, not N) ───────
+  // Only fetch for matches not already in NodeCache.
+
+  const needResults = completedFixtures.filter(({ match: m }) => !getCache(`completed_match:${m.id}`));
+
+  if (needResults.length > 0) {
+    try {
+      const ids = needResults.map(({ match: m }) => String(m.id));
+      const { data: rows } = await supabase
+        .from("match_results")
+        .select("match_id, data")
+        .in("match_id", ids);
+
+      const resultsMap = new Map((rows ?? []).map(r => [r.match_id, r.data]));
+
+      for (const { match: m } of needResults) {
+        const result = resultsMap.get(String(m.id));
+        if (result) {
+          setCache(`completed_match:${m.id}`, { ...result, status: "completed", isCompleted: true }, 24 * 60 * 60);
+          console.log(`[League] match ${m.id} result loaded from Supabase (bulk)`);
+        }
+      }
+
+      // Background: for matches still missing, try Sportsmonks (fire-and-forget)
+      for (const { match: m, startedInPast } of needResults) {
+        if (resultsMap.has(String(m.id))) continue;
+        if (!startedInPast || m.score1) continue;
+        const lockKey = `loading_result:${m.id}`;
+        if (getCache(lockKey)) continue;
+        setCache(lockKey, true, 300); // 5 min lock to avoid hammering Sportsmonks
+        sm.getFixtureDetail(m.id).then(detail => {
+          if (!detail) return;
+          const updated = normalizeFixture(detail);
+          if (updated?.score1) {
+            setCache(`completed_match:${m.id}`, { ...updated, status: "completed", isCompleted: true }, 24 * 60 * 60);
+            delCache(KEYS.LEAGUE_FIXTURES(league.slug));
+          }
+        }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn(`[League:${league.slug}] bulk match_results fetch failed:`, e.message);
+    }
+  }
+
+  // ── Pass 3: build completed list with fresh NodeCache ────────
+  const completed = completedFixtures.map(({ match: m }) => {
+    const cached = getCache(`completed_match:${m.id}`);
+    return cached ?? { ...m, status: "completed", isCompleted: true };
+  });
 
   upcoming.sort((a, b)  => new Date(a.date) - new Date(b.date));
   completed.sort((a, b) => new Date(b.date) - new Date(a.date));

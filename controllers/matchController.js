@@ -121,10 +121,21 @@ async function _resolveFullFixture(id) {
 
   // 3. Sportsmonks — single call returns everything
   const raw = await sm.getFixtureDetail(id);
-  if (!raw) return { data: null, fresh: false };
+  if (!raw) {
+    // Fallback: return basic fixture data seeded by leagueService when it
+    // fetched the league fixtures list (covers new leagues with limited
+    // per-fixture coverage on Sportsmonks, e.g. GSL 2026 upcoming matches).
+    const basic = getCache(`match:basic:${id}`);
+    if (basic) return { data: basic, fresh: false };
+    return { data: null, fresh: false };
+  }
 
   const match     = normalizeFixture(raw);
-  if (!match) return { data: null, fresh: false };
+  if (!match) {
+    const basic = getCache(`match:basic:${id}`);
+    if (basic) return { data: basic, fresh: false };
+    return { data: null, fresh: false };
+  }
 
   const scorecard = normalizeScorecard(raw);
 

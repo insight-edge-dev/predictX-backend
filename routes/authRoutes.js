@@ -28,9 +28,12 @@ const ACCESS_TOKEN_TTL   = "15m";
 const REFRESH_TOKEN_DAYS = 90;
 const SMS_URL            = "https://jskbulkmarketing.in/app/smsapi/index.php";
 
-// ── Demo account (for Google Play reviewer) ───────────────────
-const DEMO_PHONE = process.env.DEMO_PHONE || "+919000000001";
-const DEMO_OTP   = process.env.DEMO_OTP   || "123456";
+// ── Demo account (for Google Play reviewer) ──
+// Only active when both DEMO_PHONE and DEMO_OTP are explicitly set in env.
+// Never falls back to hardcoded values.
+const DEMO_PHONE = process.env.DEMO_PHONE || null;
+const DEMO_OTP   = process.env.DEMO_OTP   || null;
+const IS_PROD    = process.env.NODE_ENV === "production";
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -110,14 +113,11 @@ router.post("/auth/send-otp", async (req, res) => {
       }
     }
 
-    // Demo account — fixed OTP, no SMS
-    const isDemo = phone === DEMO_PHONE;
+    // Demo account — fixed OTP, no SMS (only when DEMO_PHONE/DEMO_OTP env vars are set)
+    const isDemo  = !!(DEMO_PHONE && DEMO_OTP && phone === DEMO_PHONE);
     const otp     = isDemo ? DEMO_OTP : generateOtp();
     const hash    = await bcrypt.hash(otp, 10);
-    // Demo OTP never expires (100 year expiry)
-    const expires = isDemo
-      ? new Date(Date.now() + 100 * 365 * 86400_000).toISOString()
-      : new Date(Date.now() + OTP_EXPIRY_MS).toISOString();
+    const expires = new Date(Date.now() + OTP_EXPIRY_MS).toISOString();
     const windowReset = !existing || (Date.now() - new Date(existing.window_start).getTime()) >= OTP_WINDOW_MS;
 
     await supabase.from("otp_requests").upsert({
@@ -130,8 +130,20 @@ router.post("/auth/send-otp", async (req, res) => {
       created_at:   new Date().toISOString(),
     }, { onConflict: "phone" });
 
-    if (!isDemo) await sendSms(phone, otp);
-    console.log(`[Auth] OTP ${isDemo ? "(demo)" : "sent"} to ${phone}`);
+    if (!isDemo) {
+      try {
+        await sendSms(phone, otp);
+        console.log(`[Auth] OTP sent to ${phone}`);
+      } catch (smsErr) {
+        console.error(`[Auth] SMS failed for ${phone}:`, smsErr.message);
+      }
+    } else {
+      console.log(`[Auth] OTP (demo) to ${phone}`);
+    }
+    // Log OTP in dev so you can test without needing SMS delivery
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[Auth] OTP for ${phone}: ${otp}`);
+    }
     return res.json({ success: true, message: "OTP sent" });
   } catch (e) {
     console.error("[Auth] send-otp error:", e.message);

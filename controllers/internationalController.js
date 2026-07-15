@@ -10,8 +10,8 @@ const { getCache, setCache, TTL } = require("../services/cacheService");
 const PRED_TTL_DB  = 365 * 24 * 60 * 60_000; // 1 year
 const PRED_TTL_MEM = TTL.DAILY;               // 24 h in memory
 
-function leagueIdFor(slug) {
-  return international.INTERNATIONAL_LEAGUES[slug]?.leagueId ?? null;
+async function leagueIdFor(slug) {
+  return international.getLeagueIdForSlug(slug);
 }
 
 async function getPersistentLightTip(match, completed, leagueId) {
@@ -70,7 +70,7 @@ async function getSeriesDetail(req, res) {
     const detail = await international.getSeriesDetail(stageId);
     if (!detail) return res.status(404).json({ error: "Series not found" });
 
-    const leagueId = leagueIdFor(detail.series.leagueSlug);
+    const leagueId = await leagueIdFor(detail.series.leagueSlug);
     const { live, upcoming, completed } = detail.matches;
     const tippable = [...live, ...upcoming, ...completed];
 
@@ -100,6 +100,27 @@ async function getSeriesDetail(req, res) {
   } catch (e) {
     console.error(`[Intl] getSeriesDetail(${stageId}) error:`, e.message);
     return res.status(500).json({ error: "Failed to load series" });
+  }
+}
+
+// ── GET /api/international/schedule ──────────────────────────
+// Returns live + today's + upcoming (7-day window) international fixtures
+// across all three buckets (T20I, WT20I, WODI), for the Discovery home screen.
+// Each fixture carries `stageId` (the series grouping key) and `leagueLabel`.
+
+async function getSchedule(req, res) {
+  const cacheKey = "intl:schedule";
+  const cached   = getCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const data    = await international.getScheduleFixtures();
+    const payload = { live: data.live, today: data.today, upcoming: data.upcoming, completed: data.completed };
+    setCache(cacheKey, payload, 5 * 60); // 5-minute cache — short enough to catch new fixtures
+    return res.json(payload);
+  } catch (e) {
+    console.error("[Intl] getSchedule error:", e.message);
+    return res.status(500).json({ live: [], today: [], upcoming: [] });
   }
 }
 
@@ -144,4 +165,4 @@ async function getMatchTip(req, res) {
   }
 }
 
-module.exports = { getSeriesList, getSeriesDetail, getMatchTip };
+module.exports = { getSeriesList, getSeriesDetail, getSchedule, getMatchTip };

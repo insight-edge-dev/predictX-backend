@@ -47,6 +47,10 @@ async function attachPriority(leagues) {
 // so users don't accidentally select them and see an empty, unsorted list.
 const INTL_BUCKET_IDS = new Set([3, 258, 261]); // T20I, Women's T20I, Women's ODI
 
+// Minimum season year to show — filters out very old/discontinued leagues
+// that haven't run since before this threshold (e.g. WCSL 2018, Finland 2020).
+const MIN_SEASON_YEAR = 2024;
+
 // ── Country → flag emoji ──────────────────────────────────────
 
 const COUNTRY_FLAGS = {
@@ -80,58 +84,66 @@ function deduplicateSlugs(leagues) {
   });
 }
 
-// ── GET /api/leagues ──────────────────────────────────────────
-// Fetches all leagues from Sportsmonks, merges with known config
-// for stage IDs, caches 24 h.
+// ── Activity window: which league IDs have fixtures right now ─
+// One Sportsmonks call (date-range filter) covers all leagues at once.
+// Window: 10 days ago → 45 days ahead. Cached 4 h.
 
-async function listLeagues(_req, res) {
-  const MEM_KEY = "all_leagues_dynamic";
-  const cached  = getCache(MEM_KEY);
-  if (cached) return res.json({ leagues: cached });
+const ACTIVITY_WINDOW_DAYS_BACK   = 10;
+const ACTIVITY_WINDOW_DAYS_AHEAD  = 45;
 
-  // Two parallel calls: all leagues + recent seasons (to find current season per league)
+async function getActiveLeagueIds() {
+  const CACHE_KEY = "active_league_ids";
+  const cached    = getCache(CACHE_KEY);
+  if (cached) return new Set(cached);
+
+  const now  = new Date();
+  const from = new Date(now - ACTIVITY_WINDOW_DAYS_BACK  * 86_400_000).toISOString().slice(0, 10);
+  const to   = new Date(now.getTime() + ACTIVITY_WINDOW_DAYS_AHEAD * 86_400_000).toISOString().slice(0, 10);
+
+  const ids = new Set();
+  for (let page = 1; page <= 3; page++) {
+    const data = await sm.getFixturesInDateRange(from, to, page);
+    if (!Array.isArray(data) || data.length === 0) break;
+    for (const f of data) if (f.league_id) ids.add(f.league_id);
+    if (data.length < 100) break;
+  }
+
+  console.log(`[LeagueCtrl] active league IDs in window: [${[...ids].join(", ")}]`);
+  setCache(CACHE_KEY, [...ids], 4 * 60 * 60); // refresh every 4 h
+  return ids;
+}
+
+// ── Raw league metadata (expensive — cached 24 h) ─────────────
+
+async function buildRawLeagueList() {
+  const RAW_KEY = "all_leagues_raw";
+  const cached  = getCache(RAW_KEY);
+  if (cached) return cached;
+
   const [rawLeagues, rawSeasons] = await Promise.all([
     sm.getAllLeagues(),
     sm.getRecentSeasons(),
   ]);
 
-  if (!rawLeagues || !Array.isArray(rawLeagues) || rawLeagues.length === 0) {
-    // API failed — return hardcoded config as fallback
-    const list = Object.values(LEAGUES).map(l => ({
-      slug: l.slug, leagueId: l.leagueId, seasonId: l.seasonId,
-      stageId: l.stageId, playoffId: l.playoffId,
-      name: l.name, short: l.short, season: l.season,
-      flag: l.flag, country: l.country, format: l.format, image: "",
-    }));
-    console.warn("[LeagueCtrl] listLeagues: Sportsmonks returned no data — using hardcoded config");
-    return res.json({ leagues: await attachPriority([...list, ...FOOTBALL_LEAGUE_LIST]) });
-  }
+  if (!rawLeagues || !Array.isArray(rawLeagues) || rawLeagues.length === 0) return null;
 
-  // Build leagueId → most-recent season map from batch response
   const seasonByLeague = {};
   if (Array.isArray(rawSeasons)) {
-    console.log(`[LeagueCtrl] batch seasons: ${rawSeasons.length} entries`);
     for (const s of rawSeasons) {
-      // Sportsmonks may use league_id or leagueId
       const lid = s.league_id ?? s.leagueId;
       if (lid && !seasonByLeague[lid]) seasonByLeague[lid] = s;
     }
-    console.log(`[LeagueCtrl] seasons mapped for ${Object.keys(seasonByLeague).length} leagues`);
-  } else {
-    console.warn("[LeagueCtrl] getRecentSeasons returned non-array:", typeof rawSeasons);
   }
 
   const known = Object.values(LEAGUES);
 
-  // For leagues missing from batch, fetch season individually (parallel, max 10 at a time)
+  // Individually fetch seasons for leagues the batch missed
   const missing = rawLeagues.filter(l =>
     !known.find(k => k.leagueId === l.id) && !seasonByLeague[l.id]
   );
   if (missing.length > 0) {
-    console.log(`[LeagueCtrl] fetching seasons individually for ${missing.length} leagues`);
     const chunks = [];
-    for (let i = 0; i < missing.length; i += 10)
-      chunks.push(missing.slice(i, i + 10));
+    for (let i = 0; i < missing.length; i += 10) chunks.push(missing.slice(i, i + 10));
     for (const chunk of chunks) {
       await Promise.all(chunk.map(async l => {
         const s = await sm.getSeasonForLeague(l.id);
@@ -142,40 +154,96 @@ async function listLeagues(_req, res) {
 
   const leagues = rawLeagues
     .map(l => {
-      const slug      = makeSlug(l.code, l.name, l.id);
       const knownConf = known.find(k => k.leagueId === l.id) ?? null;
+      const slug      = knownConf?.slug ?? makeSlug(l.code, l.name, l.id);
       const season    = seasonByLeague[l.id] ?? null;
       const seasonId  = knownConf?.seasonId ?? season?.id   ?? null;
       const yearLabel = knownConf?.season   ?? String(season?.name ?? season?.year ?? "");
-
       return {
-        slug,
-        leagueId:  l.id,
-        seasonId,
+        slug, leagueId: l.id, seasonId,
         stageId:   knownConf?.stageId   ?? null,
         playoffId: knownConf?.playoffId ?? null,
         name:      l.name        ?? "",
-        short:     l.code        ?? l.name?.slice(0, 6) ?? "",
+        short:     knownConf?.short ?? l.code ?? l.name?.slice(0, 6) ?? "",
         season:    yearLabel,
         flag:      knownConf?.flag ?? countryFlag(l.country?.name),
         country:   l.country?.name ?? "",
-        format:    "T20",
+        format:    knownConf?.format ?? "T20",
         image:     l.image_path  ?? "",
+        sport:     "cricket",
       };
     })
-    .filter(l => l.seasonId && !INTL_BUCKET_IDS.has(l.leagueId))  // exclude international buckets
-    .sort((a, b) => {
-      const aK = !!known.find(k => k.leagueId === a.leagueId);
-      const bK = !!known.find(k => k.leagueId === b.leagueId);
+    .filter(l => l.seasonId && !INTL_BUCKET_IDS.has(l.leagueId));
+
+  const result = deduplicateSlugs([...leagues, ...FOOTBALL_LEAGUE_LIST]);
+  setCache(RAW_KEY, result, TTL.DAILY);
+  return result;
+}
+
+// ── GET /api/leagues ──────────────────────────────────────────
+// Returns ALL accessible leagues with a `status` field:
+//   'active'    — has fixtures in the -10 d / +45 d window (ongoing or upcoming)
+//   'completed' — no fixtures in window (season finished)
+// Raw metadata cached 24 h; activity window refreshes every 4 h.
+// Leagues with seasons older than MIN_SEASON_YEAR are excluded.
+// Sort order: active leagues first (known-config → alphabetical),
+//             then completed leagues (known-config → alphabetical).
+
+function seasonYear(s) {
+  return parseInt(String(s || "0").slice(0, 4)) || 0;
+}
+
+async function listLeagues(_req, res) {
+  try {
+    // 1. Raw metadata (24 h cache)
+    let raw = await buildRawLeagueList();
+
+    if (!raw) {
+      // Sportsmonks down — return full hardcoded config
+      const list = Object.values(LEAGUES).map(l => ({
+        slug: l.slug, leagueId: l.leagueId, seasonId: l.seasonId,
+        stageId: l.stageId, playoffId: l.playoffId,
+        name: l.name, short: l.short, season: l.season,
+        flag: l.flag, country: l.country, format: l.format, image: "", sport: "cricket",
+        status: "active",
+      }));
+      console.warn("[LeagueCtrl] listLeagues: Sportsmonks down — using hardcoded fallback");
+      return res.json({ leagues: await attachPriority([...list, ...FOOTBALL_LEAGUE_LIST.map(l => ({ ...l, status: "active" }))]) });
+    }
+
+    // 2. Activity window (4 h cache) — used for status badge + sort, not filtering
+    const activeIds = await getActiveLeagueIds();
+
+    // 3. Filter out very old leagues (pre-MIN_SEASON_YEAR) and attach status
+    const withStatus = raw
+      .filter(l => l.sport === "football" || seasonYear(l.season) >= MIN_SEASON_YEAR)
+      .map(l => ({
+        ...l,
+        status: (l.sport === "football" || activeIds.has(l.leagueId)) ? "active" : "completed",
+      }));
+
+    // 4. Sort: active first, within each group known-config leagues before
+    //    auto-discovered, then alphabetical.
+    const known = new Set(Object.values(LEAGUES).map(l => l.leagueId));
+    withStatus.sort((a, b) => {
+      const aActive = a.status === "active", bActive = b.status === "active";
+      if (aActive && !bActive) return -1;
+      if (!aActive && bActive) return  1;
+      const aK = known.has(a.leagueId), bK = known.has(b.leagueId);
       if (aK && !bK) return -1;
       if (!aK && bK) return  1;
       return a.name.localeCompare(b.name);
     });
 
-  const unique = await attachPriority(deduplicateSlugs([...leagues, ...FOOTBALL_LEAGUE_LIST]));
-  setCache(MEM_KEY, unique, TTL.DAILY);
-  console.log(`[LeagueCtrl] listLeagues: ${unique.length} leagues total (incl. football)`);
-  res.json({ leagues: unique });
+    const result = await attachPriority(withStatus);
+    const activeCount    = result.filter(l => l.status === "active").length;
+    const completedCount = result.filter(l => l.status === "completed").length;
+    console.log(`[LeagueCtrl] listLeagues: ${result.length} leagues (${activeCount} active, ${completedCount} completed)`);
+    res.json({ leagues: result });
+  } catch (e) {
+    console.error("[LeagueCtrl] listLeagues error:", e.message);
+    res.status(500).json({ error: "Failed to fetch leagues" });
+  }
 }
 
 // ── Resolve league from slug ──────────────────────────────────

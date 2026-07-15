@@ -34,6 +34,11 @@ router.get("/notifications", async (req, res) => {
 router.get("/expert-predictions", async (req, res) => {
   const { league } = req.query;
 
+  // Validate league slug — alphanumeric, hyphens, underscores only
+  if (league && !/^[a-z0-9_-]{1,40}$/.test(league)) {
+    return res.status(400).json({ error: "Invalid league parameter" });
+  }
+
   let query = supabase
     .from("expert_predictions")
     .select("*")
@@ -59,6 +64,11 @@ router.get("/banners", async (req, res) => {
   const { placement } = req.query;
   if (!placement) return res.status(400).json({ error: "placement is required" });
 
+  // Validate placement — alphanumeric, hyphens, underscores only
+  if (!/^[a-z0-9_-]{1,40}$/.test(placement)) {
+    return res.status(400).json({ error: "Invalid placement parameter" });
+  }
+
   let query = supabase.from("banners").select("*").eq("is_active", true);
   query = placement === "discovery"
     ? query.contains("placements", ["discovery"])
@@ -68,6 +78,21 @@ router.get("/banners", async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ banners: data ?? [] });
+});
+
+// ── GET /api/app-version ──────────────────────────────────────
+// Returns the minimum supported app version and latest version.
+// Update MIN_VERSION here to force old users to update.
+
+const MIN_VERSION    = "1.0.0";
+const LATEST_VERSION = "1.0.0";
+
+router.get("/app-version", (_req, res) => {
+  res.json({
+    minVersion:    MIN_VERSION,
+    latestVersion: LATEST_VERSION,
+    message:       "A new version of PredictX is available with improvements and bug fixes.",
+  });
 });
 
 module.exports = router;
