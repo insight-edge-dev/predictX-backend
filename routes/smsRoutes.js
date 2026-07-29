@@ -38,7 +38,8 @@ router.post("/auth/sms-hook", async (req, res) => {
   const phone = req.body.phone || req.body.user?.phone;
   const otp   = req.body.otp   || req.body.sms?.otp;
 
-  console.log(`[SMSHook] Sending OTP to ${phone}`);
+  const maskedPhone = phone ? phone.slice(-4).padStart(phone.length, "*") : "unknown";
+  console.log(`[SMSHook] Sending OTP to ${maskedPhone}`);
 
   if (!phone || !otp) {
     console.error("[SMSHook] Missing phone or otp. Body:", req.body);

@@ -95,4 +95,20 @@ router.get("/app-version", (_req, res) => {
   });
 });
 
+// ── GET /api/config ───────────────────────────────────────────
+// Remote feature flags. Change values here to toggle features
+// across all clients without a new app build.
+
+router.get("/config", (_req, res) => {
+  res.json({
+    predictions_enabled:  true,
+    news_enabled:         true,
+    tips_enabled:         true,
+    comments_enabled:     true,
+    leaderboard_enabled:  true,
+    maintenance_mode:     false,
+    maintenance_message:  "PredictX is under maintenance. Back shortly!",
+  });
+});
+
 module.exports = router;

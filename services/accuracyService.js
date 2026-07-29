@@ -249,23 +249,17 @@ async function computeLeagueCards(perLeagueLimit = 5) {
 
     Promise.all(Object.values(LEAGUES).filter(l => isCardVisible(l.slug)).map(async league => {
       try {
-        const { upcoming, completed } = await leagueService.getLeagueMatches(league);
-        const rows = sortByDateDesc(buildRows(completed, cricketPredictions, resolveCricketResult, "pred:light:", cricketRow(league.short)));
+        const { upcoming } = await leagueService.getLeagueMatches(league);
+        if (upcoming.length === 0) return null;
 
-        const seasonOver = completed.length > 0 && completed[0].matchStage === "FINAL";
-        const finalMatch = seasonOver ? completed.find(m => m.matchStage === "FINAL") : null;
-
-        let upcomingRow = null;
-        if (!seasonOver && upcoming.length > 0) {
-          await ensureUpcomingPrediction(league.slug, upcoming[0], cricketPredictions, "pred:light:");
-          upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(league.short));
-        }
+        await ensureUpcomingPrediction(league.slug, upcoming[0], cricketPredictions, "pred:light:");
+        const upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(league.short));
 
         return {
           slug: league.slug, name: league.name, season: league.season, flag: league.flag,
           short: league.short, image: leagueImages.get(league.leagueId) || "", sport: "cricket",
           accuracy: await getLeagueAccuracyPublic(league.slug),
-          recentMatches: selectCardRows(seasonOver, finalMatch?.id, upcomingRow, rows, perLeagueLimit),
+          recentMatches: upcomingRow ? [upcomingRow] : [],
         };
       } catch (e) {
         console.warn(`[Accuracy] league cards: cricket ${league.slug} failed:`, e.message);
@@ -275,22 +269,16 @@ async function computeLeagueCards(perLeagueLimit = 5) {
 
     Promise.all(Object.values(FOOTBALL_LEAGUES).filter(l => isCardVisible(l.slug)).map(async footballLeague => {
       try {
-        const { upcoming, completed } = await footballService.getMatches();
-        const rows = sortByDateDesc(buildRows(completed, footballPredictions, resolveFootballResult, "football:tip:", footballRow(footballLeague.short)));
+        const { upcoming } = await footballService.getMatches();
+        if (upcoming.length === 0) return null;
 
-        const seasonOver = completed.length > 0 && completed[0].stage === "Final";
-        const finalMatch = seasonOver ? completed.find(m => m.stage === "Final") : null;
-
-        let upcomingRow = null;
-        if (!seasonOver && upcoming.length > 0) {
-          upcomingRow = buildUpcomingRow(upcoming[0], footballPredictions, "football:tip:", footballRow(footballLeague.short));
-        }
+        const upcomingRow = buildUpcomingRow(upcoming[0], footballPredictions, "football:tip:", footballRow(footballLeague.short));
 
         return {
           slug: footballLeague.slug, name: footballLeague.name, season: footballLeague.season, flag: footballLeague.flag,
           short: footballLeague.short, image: footballLeague.image ?? "", sport: "football",
           accuracy: await getLeagueAccuracyPublic(footballLeague.slug),
-          recentMatches: selectCardRows(seasonOver, finalMatch?.id, upcomingRow, rows, perLeagueLimit),
+          recentMatches: upcomingRow ? [upcomingRow] : [],
         };
       } catch (e) {
         console.warn(`[Accuracy] league cards: football ${footballLeague.slug} failed:`, e.message);
@@ -301,18 +289,18 @@ async function computeLeagueCards(perLeagueLimit = 5) {
     Promise.all(Object.values(internationalService.INTERNATIONAL_LEAGUES).filter(b => isCardVisible(b.slug)).map(async bucket => {
       try {
         const fixtures = await internationalService.getBucketFixtures(bucket);
-        const completed = fixtures.filter(m => internationalService.effectiveStatus(m) === "completed");
         const upcoming = fixtures
           .filter(m => internationalService.effectiveStatus(m) === "upcoming")
           .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-        const rows = sortByDateDesc(buildRows(completed, cricketPredictions, resolveCricketResult, "pred:light:", cricketRow(bucket.short)));
+        if (upcoming.length === 0) return null;
+
         const upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(bucket.short));
 
         return {
           slug: bucket.slug, name: bucket.name, season: "International", flag: bucket.flag,
           short: bucket.short, image: leagueImages.get(bucket.leagueId) || "", sport: "cricket",
           accuracy: await getLeagueAccuracyPublic(bucket.slug),
-          recentMatches: selectCardRows(false, null, upcomingRow, rows, perLeagueLimit),
+          recentMatches: upcomingRow ? [upcomingRow] : [],
         };
       } catch (e) {
         console.warn(`[Accuracy] league cards: international ${bucket.slug} failed:`, e.message);

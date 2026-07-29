@@ -396,13 +396,11 @@ async function reorderBanners(req, res) {
     return res.status(400).json({ error: "order must be a non-empty array of banner ids" });
   }
 
-  for (let i = 0; i < order.length; i++) {
-    const { error } = await supabase
-      .from("banners")
-      .update({ display_order: i, updated_at: new Date().toISOString() })
-      .eq("id", order[i]);
-    if (error) return res.status(500).json({ error: error.message });
-  }
+  const results = await Promise.all(order.map((id, i) =>
+    supabase.from("banners").update({ display_order: i, updated_at: new Date().toISOString() }).eq("id", id)
+  ));
+  const failed = results.find(r => r.error);
+  if (failed) return res.status(500).json({ error: failed.error.message });
 
   return res.json({ success: true });
 }
@@ -513,17 +511,16 @@ async function reorderFacts(req, res) {
     return res.status(400).json({ error: "order must be a non-empty array of fact ids" });
   }
 
-  const sports = new Set();
-  for (let i = 0; i < order.length; i++) {
-    const { data, error } = await supabase
-      .from("home_facts")
-      .update({ display_order: i })
-      .eq("id", order[i])
-      .select("sport")
-      .single();
-    if (error) return res.status(500).json({ error: error.message });
-    sports.add(data.sport);
-  }
+  const { data: factRows, error: fetchErr } = await supabase
+    .from("home_facts").select("id, sport").in("id", order);
+  if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+  const sports = new Set((factRows ?? []).map(r => r.sport));
+
+  const results = await Promise.all(order.map((id, i) =>
+    supabase.from("home_facts").update({ display_order: i }).eq("id", id)
+  ));
+  const failed = results.find(r => r.error);
+  if (failed) return res.status(500).json({ error: failed.error.message });
 
   sports.forEach(invalidateFactsCache);
   return res.json({ success: true });
@@ -624,13 +621,11 @@ async function reorderHomeSections(req, res) {
     return res.status(400).json({ error: "order must be a non-empty array of section keys" });
   }
 
-  for (let i = 0; i < order.length; i++) {
-    const { error } = await supabase
-      .from("home_sections")
-      .update({ display_order: i })
-      .eq("key", order[i]);
-    if (error) return res.status(500).json({ error: error.message });
-  }
+  const results = await Promise.all(order.map((key, i) =>
+    supabase.from("home_sections").update({ display_order: i }).eq("key", key)
+  ));
+  const failed = results.find(r => r.error);
+  if (failed) return res.status(500).json({ error: failed.error.message });
 
   invalidateSectionsCache();
   return res.json({ success: true });
@@ -753,12 +748,9 @@ async function reorderLeagueCards(req, res) {
     return res.status(400).json({ error: "order must be a non-empty array of league slugs" });
   }
 
-  for (let i = 0; i < order.length; i++) {
-    const { error } = await supabase
-      .from("league_card_settings")
-      .upsert({ slug: order[i], display_order: i, updated_at: new Date().toISOString() });
-    if (error) return res.status(500).json({ error: error.message });
-  }
+  const rows = order.map((slug, i) => ({ slug, display_order: i, updated_at: new Date().toISOString() }));
+  const { error } = await supabase.from("league_card_settings").upsert(rows);
+  if (error) return res.status(500).json({ error: error.message });
 
   invalidateLeagueCardsCache();
   return res.json({ success: true });

@@ -24,6 +24,16 @@ const commentSvc    = require("../services/commentService");
 const predSvc       = require("../services/userPredictionService");
 const upvoteSvc     = require("../services/upvoteService");
 const { getCache, setCache } = require("../services/cacheService");
+const supabase      = require("../config/supabase");
+
+async function getDisplayName(userId) {
+  try {
+    const { data } = await supabase.from("app_users").select("display_name").eq("id", userId).single();
+    return data?.display_name || "User";
+  } catch {
+    return "User";
+  }
+}
 
 const router = express.Router();
 
@@ -52,9 +62,10 @@ router.post("/comments", requireAuth, async (req, res) => {
   if (!contextId) return res.status(400).json({ error: "contextId is required" });
 
   try {
+    const displayName = await getDisplayName(req.user.id);
     const comment = await commentSvc.postComment(
       req.user.id,
-      req.body.displayName || "User",
+      displayName,
       contextType,
       String(contextId),
       content,
@@ -131,14 +142,15 @@ router.get("/user-predictions/:matchId", requireAuth, async (req, res) => {
 
 // Submit prediction — auth required
 router.post("/user-predictions/:matchId", requireAuth, async (req, res) => {
-  const { predictedWinner, teamA, teamB, sport, displayName } = req.body;
+  const { predictedWinner, teamA, teamB, sport } = req.body;
   if (!predictedWinner || !teamA || !teamB || !sport) {
     return res.status(400).json({ error: "predictedWinner, teamA, teamB and sport are required" });
   }
   try {
+    const displayName = await getDisplayName(req.user.id);
     await predSvc.submitPrediction(
       req.user.id,
-      displayName || "User",
+      displayName,
       req.params.matchId,
       sport,
       predictedWinner,

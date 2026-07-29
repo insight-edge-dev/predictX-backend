@@ -21,53 +21,42 @@ function err(msg, status) {
   return Object.assign(new Error(msg), { status });
 }
 
+// Atomic poll update via Postgres RPC — avoids read-modify-write race condition.
+// SQL to create the function (run once in Supabase SQL Editor):
+//
+//   create or replace function update_prediction_poll(
+//     p_match_id text, p_team_a_name text, p_team_b_name text,
+//     p_old_winner text, p_new_winner text
+//   ) returns void language plpgsql as $$
+//   declare
+//     v_a int:=0; v_b int:=0; v_draw int:=0; v_tot int:=0;
+//   begin
+//     if p_old_winner = p_team_a_name then v_a:=v_a-1; v_tot:=v_tot-1;
+//     elsif p_old_winner = 'draw'     then v_draw:=v_draw-1; v_tot:=v_tot-1;
+//     elsif p_old_winner is not null  then v_b:=v_b-1; v_tot:=v_tot-1; end if;
+//     if p_new_winner = p_team_a_name then v_a:=v_a+1; v_tot:=v_tot+1;
+//     elsif p_new_winner = 'draw'     then v_draw:=v_draw+1; v_tot:=v_tot+1;
+//     else                                 v_b:=v_b+1; v_tot:=v_tot+1; end if;
+//     insert into match_prediction_stats
+//       (match_id,team_a_name,team_b_name,team_a_count,draw_count,team_b_count,total,updated_at)
+//     values(p_match_id,p_team_a_name,p_team_b_name,greatest(0,v_a),greatest(0,v_draw),greatest(0,v_b),greatest(0,v_tot),now())
+//     on conflict(match_id) do update set
+//       team_a_count=greatest(0,match_prediction_stats.team_a_count+v_a),
+//       draw_count  =greatest(0,match_prediction_stats.draw_count+v_draw),
+//       team_b_count=greatest(0,match_prediction_stats.team_b_count+v_b),
+//       total       =greatest(0,match_prediction_stats.total+v_tot),
+//       updated_at  =now();
+//   end; $$;
+
 async function _updatePollCache(matchId, teamAName, teamBName, oldWinner, newWinner) {
-  // Fetch current row (may not exist yet)
-  const { data: row } = await supabase
-    .from("match_prediction_stats")
-    .select("*")
-    .eq("match_id", matchId)
-    .single();
-
-  if (!row) {
-    // First prediction for this match — create the row
-    const initial = {
-      match_id:     matchId,
-      team_a_name:  teamAName,
-      team_b_name:  teamBName,
-      team_a_count: newWinner === teamAName ? 1 : 0,
-      draw_count:   newWinner === "draw"    ? 1 : 0,
-      team_b_count: newWinner === teamBName ? 1 : 0,
-      total:        1,
-      updated_at:   new Date().toISOString(),
-    };
-    await supabase.from("match_prediction_stats").insert(initial);
-    return;
-  }
-
-  // Build incremental update
-  const patch = { updated_at: new Date().toISOString() };
-
-  // Decrement old pick
-  if (oldWinner) {
-    if (oldWinner === row.team_a_name) patch.team_a_count = Math.max(0, row.team_a_count - 1);
-    else if (oldWinner === "draw")     patch.draw_count   = Math.max(0, row.draw_count   - 1);
-    else                               patch.team_b_count = Math.max(0, row.team_b_count - 1);
-    patch.total = Math.max(0, row.total - 1);
-  }
-
-  // Increment new pick (work from already-patched values)
-  const curA    = patch.team_a_count ?? row.team_a_count;
-  const curDraw = patch.draw_count   ?? row.draw_count;
-  const curB    = patch.team_b_count ?? row.team_b_count;
-  const curTot  = patch.total        ?? row.total;
-
-  if (newWinner === row.team_a_name) patch.team_a_count = curA    + 1;
-  else if (newWinner === "draw")     patch.draw_count   = curDraw + 1;
-  else                               patch.team_b_count = curB    + 1;
-  patch.total = curTot + 1;
-
-  await supabase.from("match_prediction_stats").update(patch).eq("match_id", matchId);
+  const { error } = await supabase.rpc("update_prediction_poll", {
+    p_match_id:    matchId,
+    p_team_a_name: teamAName,
+    p_team_b_name: teamBName,
+    p_old_winner:  oldWinner ?? null,
+    p_new_winner:  newWinner,
+  });
+  if (error) console.error("[Prediction] poll update RPC error:", error.message);
 }
 
 // ── Public API ────────────────────────────────────────────────

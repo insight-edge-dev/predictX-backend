@@ -6,6 +6,7 @@ const cors        = require("cors");
 const compression = require("compression");
 const rateLimit   = require("express-rate-limit");
 
+const helmet           = require("helmet");
 const footballRoutes   = require("./routes/footballRoutes");
 const matchRoutes      = require("./routes/matchRoutes");
 const adminRoutes      = require("./routes/adminRoutes");
@@ -89,6 +90,7 @@ app.use(cors({
   },
   credentials: true,
 }));
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
 
 app.use((req, _res, next) => {
@@ -119,7 +121,66 @@ app.use("/api", communityRoutes);
 // ── Health check ──────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", ts: new Date().toISOString(), cache: getStats() });
+  res.json({ status: "ok", ts: new Date().toISOString() });
+});
+
+// ── AdMob app-ads.txt verification ───────────────────────────
+// Google crawls this to verify that this server owns the app.
+
+app.get("/app-ads.txt", (_req, res) => {
+  res.type("text/plain").send(
+    "google.com, pub-4645762055732117, DIRECT, f08c47fec0942fa0\n"
+  );
+});
+
+// ── Android App Links verification ───────────────────────────
+// Android fetches this URL to verify that this server owns the app.
+// SHA-256 fingerprint: get from Google Play Console → App signing → SHA-256 certificate fingerprint.
+
+app.get("/.well-known/assetlinks.json", (_req, res) => {
+  res.json([{
+    relation: ["delegate_permission/common.handle_all_urls"],
+    target: {
+      namespace:               "android_app",
+      package_name:            "com.insideedge.cricvora",
+      sha256_cert_fingerprints: [
+        process.env.ANDROID_SHA256_FINGERPRINT || "REPLACE_WITH_SHA256_FROM_PLAY_CONSOLE",
+      ],
+    },
+  }]);
+});
+
+// ── Deep link fallback: /match/:id ────────────────────────────
+// Opened when app is NOT installed. Redirects to Play Store.
+
+app.get("/match/:id", (req, res) => {
+  const id     = (req.params.id ?? "").replace(/[^a-zA-Z0-9_-]/g, "");
+  const sport  = req.query.sport ?? "";
+  const scheme = sport === "football"
+    ? `predictx://(match-details)/${id}?sport=football`
+    : `predictx://(match-details)/${id}`;
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PredictX</title>
+  <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0B0B0B;color:#fff;text-align:center;padding:24px}</style>
+  <script>
+    window.location.href = "${scheme}";
+    setTimeout(function(){
+      window.location.href = "https://play.google.com/store/apps/details?id=com.insideedge.cricvora";
+    }, 1500);
+  </script>
+</head>
+<body>
+  <div>
+    <h2>Opening PredictX…</h2>
+    <p>If nothing happens, <a href="https://play.google.com/store/apps/details?id=com.insideedge.cricvora" style="color:#E6FF00">download the app</a>.</p>
+  </div>
+</body>
+</html>`);
 });
 
 // ── Admin: flush all caches ───────────────────────────────────
@@ -229,6 +290,8 @@ server.listen(PORT, "0.0.0.0", () => {
 
   // Pre-warm expensive caches so the first app open hits memory, not live computation.
   // Bundle warming also warms leagueCards, cricket matches, intl, football and news in one shot.
+  // Delay gives the DB connection pool time to stabilise after cold start.
+  const WARM_DELAY_MS = parseInt(process.env.WARM_DELAY_MS ?? "5000", 10);
   setTimeout(async () => {
     try {
       const homeRouteModule = require("./routes/homeRoutes");
@@ -265,7 +328,7 @@ server.listen(PORT, "0.0.0.0", () => {
     } catch (e) {
       console.warn("[Warm] home bundle failed:", e.message);
     }
-  }, 3000);
+  }, WARM_DELAY_MS);
 
   // Tips bundle is NOT warmed at startup — each league processes 30-100+
   // completed matches against Supabase. Warming all leagues simultaneously

@@ -130,19 +130,16 @@ router.post("/auth/send-otp", async (req, res) => {
       created_at:   new Date().toISOString(),
     }, { onConflict: "phone" });
 
+    const maskedPhone = phone.slice(-4).padStart(phone.length, "*");
     if (!isDemo) {
       try {
         await sendSms(phone, otp);
-        console.log(`[Auth] OTP sent to ${phone}`);
+        console.log(`[Auth] OTP sent to ${maskedPhone}`);
       } catch (smsErr) {
-        console.error(`[Auth] SMS failed for ${phone}:`, smsErr.message);
+        console.error(`[Auth] SMS failed for ${maskedPhone}:`, smsErr.message);
       }
     } else {
-      console.log(`[Auth] OTP (demo) to ${phone}`);
-    }
-    // Log OTP in dev so you can test without needing SMS delivery
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`[Auth] OTP for ${phone}: ${otp}`);
+      console.log(`[Auth] OTP (demo) to ${maskedPhone}`);
     }
     return res.json({ success: true, message: "OTP sent" });
   } catch (e) {

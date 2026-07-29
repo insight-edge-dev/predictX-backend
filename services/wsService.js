@@ -23,6 +23,7 @@ const POLL_LIVE_MS   =  10_000;   // 10 s when a match is live
 const POLL_IDLE_MS   =  60_000;   // 60 s when nothing is live
 const PING_MS        =  20_000;
 const MAX_WS_CLIENTS =  200;      // hard cap — Supabase Realtime also has a 200-conn limit
+const MAX_PER_IP     =    5;      // max concurrent connections per IP
 
 let wss              = null;
 let pollTimer        = null;
@@ -30,8 +31,11 @@ let pingTimer        = null;
 let lastIplPayload   = null;
 let lastLeaguesPayload = null;
 
-// Track milestones already sent this session — key: `${matchId}:w${threshold}`
+// Track milestones already sent this session — key: `${matchId}:${slot}:w${threshold}`
 const _milestoneSent = new Map();
+
+// Per-IP connection counts for DoS protection
+const _ipConnections = new Map();
 
 function _extractWickets(scoreStr) {
   if (!scoreStr) return null;
@@ -158,6 +162,10 @@ async function poll() {
       // If normalizer detected completion via statusText, persist result to
       // Supabase (survives restarts) + bust fixtures cache.
       if (m.status === "completed") {
+        // Evict milestone keys for this match — prevents the Map from growing unbounded
+        for (const key of _milestoneSent.keys()) {
+          if (key.startsWith(`${m.id}:`)) _milestoneSent.delete(key);
+        }
         if (league) {
           // Domestic league: bust the cached fixture list and persist to Supabase
           delCache(KEYS.LEAGUE_FIXTURES(league.slug));
@@ -247,8 +255,14 @@ function init(server) {
       ws.close(1013, "Server capacity reached");
       return;
     }
-    const ip = req.socket.remoteAddress;
-    console.log(`[WS] client connected (${ip}) — total: ${clientCount()}`);
+    const ip = req.socket.remoteAddress ?? "unknown";
+    const ipCount = (_ipConnections.get(ip) ?? 0);
+    if (ipCount >= MAX_PER_IP) {
+      ws.close(1013, "Too many connections from your IP");
+      return;
+    }
+    _ipConnections.set(ip, ipCount + 1);
+    console.log(`[WS] client connected — total: ${clientCount() + 1}`);
     ws.isAlive = true;
     ws.on("pong", () => { ws.isAlive = true; });
 
@@ -257,7 +271,12 @@ function init(server) {
     if (lastLeaguesPayload) safeSend(ws, JSON.stringify(lastLeaguesPayload));
     if (lastIplPayload)     safeSend(ws, JSON.stringify(lastIplPayload));
 
-    ws.on("close", () => console.log(`[WS] client disconnected — total: ${clientCount()}`));
+    ws.on("close", () => {
+      const cur = _ipConnections.get(ip) ?? 1;
+      if (cur <= 1) _ipConnections.delete(ip);
+      else _ipConnections.set(ip, cur - 1);
+      console.log(`[WS] client disconnected — total: ${clientCount()}`);
+    });
     ws.on("error", e => console.warn("[WS] client error:", e.message));
   });
 
