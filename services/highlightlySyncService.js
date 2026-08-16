@@ -926,6 +926,10 @@ function start() {
     // Without this, a recovering Postgres gets saturated the moment the
     // worker restarts, keeping it in a 522-timeout loop indefinitely.
     await _waitForDb();
+    // Extra settling time: _waitForDb passes on the first successful SELECT,
+    // but Postgres may still be warming up its connection pool. 30s here lets
+    // it stabilise before any write-heavy sync job fires.
+    await _delay(30_000);
 
     // ── Recurring jobs ────────────────────────────────────────
 
