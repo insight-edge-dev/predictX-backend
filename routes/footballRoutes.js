@@ -14,7 +14,11 @@ router.get("/football/matches",          controller.getMatches);
 router.get("/football/tips/:matchId",    controller.getMatchTip);
 router.get("/football/tips",             controller.getTipsList);
 
-router.get("/football/groups/:group",    controller.getGroup);
-router.get("/football/groups",           controller.getGroups);
+router.get("/football/groups/:group",        controller.getGroup);
+router.get("/football/groups",               controller.getGroups);
+
+router.get("/football/matches/:id/lineups",  controller.getMatchLineups);
+router.get("/football/matches/:id/events",   controller.getMatchEvents);
+router.get("/football/matches/:id/stats",    controller.getMatchStats);
 
 module.exports = router;

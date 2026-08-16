@@ -77,7 +77,15 @@ router.get("/banners", async (req, res) => {
   const { data, error } = await query.order("display_order", { ascending: true });
 
   if (error) return res.status(500).json({ error: error.message });
-  return res.json({ banners: data ?? [] });
+
+  const now = new Date();
+  const scheduled = (data ?? []).filter(b => {
+    if (b.starts_at && new Date(b.starts_at) > now) return false;
+    if (b.ends_at   && new Date(b.ends_at)   < now) return false;
+    return true;
+  });
+
+  return res.json({ banners: scheduled });
 });
 
 // ── GET /api/app-version ──────────────────────────────────────

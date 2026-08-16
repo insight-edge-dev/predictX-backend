@@ -25,6 +25,7 @@ const authRoutes       = require("./routes/authRoutes");
 const venueRoutes      = require("./routes/venueRoutes");
 const internationalRoutes = require("./routes/internationalRoutes");
 const communityRoutes     = require("./routes/communityRoutes");
+const highlightRoutes     = require("./routes/highlightRoutes");
 
 const { getStats, flushCache }    = require("./services/cacheService");
 const { resetIPLCache, getIPLFixtures } = require("./services/iplService");
@@ -35,6 +36,9 @@ const footballScheduler           = require("./services/footballSchedulerService
 const predictionScheduler         = require("./services/predictionSchedulerService");
 const resolverService             = require("./services/resolverService");
 const pushScheduler               = require("./services/pushSchedulerService");
+const { dbWriteQueue }            = require("./services/dbWriteQueue");
+const { getRecentJobs, getWorkerStatus } = require("./services/syncLogger");
+const { highlightlyLimiter }      = require("./services/apiRateLimiter");
 
 const app    = express();
 const server = http.createServer(app);
@@ -51,7 +55,7 @@ app.use(compression());
 
 const apiLimiter = rateLimit({
   windowMs:        60_000,
-  max:             120,
+  max:             600,   // app fires 60+ league queries + predictions on startup
   standardHeaders: true,
   legacyHeaders:   false,
   message:         { error: "Too many requests, please slow down." },
@@ -94,7 +98,9 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json());
 
 app.use((req, _res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  if (process.env.LOG_REQUESTS === "true") {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  }
   next();
 });
 
@@ -117,11 +123,35 @@ app.use("/api", userRoutes);
 app.use("/api", venueRoutes);
 app.use("/api", internationalRoutes);
 app.use("/api", communityRoutes);
+app.use("/api", highlightRoutes);
 
 // ── Health check ──────────────────────────────────────────────
+// Basic liveness probe (load balancers, uptime monitors)
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", ts: new Date().toISOString() });
+});
+
+// Rich pipeline health — sync job history, queue depths, circuit state, worker liveness
+app.get("/api/health", adminAuth, async (_req, res) => {
+  try {
+    const [recentJobs, worker] = await Promise.all([getRecentJobs(30), getWorkerStatus()]);
+    res.json({
+      status:    "ok",
+      ts:        new Date().toISOString(),
+      writeQueue: {
+        depth:       dbWriteQueue.depth,
+        circuitOpen: dbWriteQueue.isCircuitOpen,
+      },
+      apiLimiter: {
+        queueDepth: highlightlyLimiter.queueDepth,
+      },
+      worker,
+      recentJobs,
+    });
+  } catch (e) {
+    res.status(500).json({ status: "error", error: e.message });
+  }
 });
 
 // ── AdMob app-ads.txt verification ───────────────────────────
@@ -273,20 +303,44 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
+// ── Graceful shutdown ─────────────────────────────────────────
+
+async function shutdown(signal) {
+  console.log(`[Server] ${signal} — closing HTTP server`);
+  server.close(async () => {
+    // Drain any serving-path fire-and-forget writes still in the queue
+    if (dbWriteQueue.depth > 0) {
+      console.log(`[Server] draining write queue (${dbWriteQueue.depth} pending)...`);
+      await new Promise(resolve => {
+        const iv = setInterval(() => {
+          if (dbWriteQueue.depth === 0) { clearInterval(iv); resolve(); }
+        }, 100);
+        setTimeout(() => { clearInterval(iv); resolve(); }, 10_000);
+      });
+    }
+    console.log("[Server] shutdown complete");
+    process.exit(0);
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
+
 // ── Start ─────────────────────────────────────────────────────
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[Server] PredictX backend listening on 0.0.0.0:${PORT}`);
-  console.log(`[Server] SPORTMONKS_API_KEY: ${process.env.SPORTMONKS_API_KEY ? process.env.SPORTMONKS_API_KEY.slice(0, 8) + "…" : "MISSING"}`);
-  console.log(`[Server] CRICBUZZ_API_KEY:   ${process.env.CRICBUZZ_API_KEY   ? process.env.CRICBUZZ_API_KEY.slice(0, 8)   + "…" : "MISSING (news/rankings degraded)"}`);
-  console.log(`[Server] SUPABASE_URL:       ${process.env.SUPABASE_URL || "MISSING"}`);
-  console.log(`[Server] APIFOOTBALL_KEY:    ${process.env.APIFOOTBALL_KEY ? process.env.APIFOOTBALL_KEY.slice(0, 8) + "…" : "MISSING (football degraded)"}`);
+  console.log(`[Server] HIGHLIGHTLY_API_KEY: ${process.env.HIGHLIGHTLY_API_KEY ? process.env.HIGHLIGHTLY_API_KEY.slice(0, 8) + "…" : "MISSING — all cricket/football data degraded"}`);
+  console.log(`[Server] CRICBUZZ_API_KEY:    ${process.env.CRICBUZZ_API_KEY   ? process.env.CRICBUZZ_API_KEY.slice(0, 8)   + "…" : "MISSING (news/rankings degraded)"}`);
+  console.log(`[Server] SUPABASE_URL:        ${process.env.SUPABASE_URL || "MISSING"}`);
+  console.log(`[Server] APIFOOTBALL_KEY:     ${process.env.APIFOOTBALL_KEY ? process.env.APIFOOTBALL_KEY.slice(0, 8) + "…" : "MISSING (football-data.org degraded)"}`);
 
   wsService.init(server);
   footballScheduler.start();
   predictionScheduler.start();
   resolverService.startResolver();
   pushScheduler.startScheduler();
+  // highlightlySync runs in worker.js (separate process) — not started here
 
   // Pre-warm expensive caches so the first app open hits memory, not live computation.
   // Bundle warming also warms leagueCards, cricket matches, intl, football and news in one shot.

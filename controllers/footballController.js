@@ -6,6 +6,9 @@
 const footballService    = require("../services/footballService");
 const predictionService  = require("../services/footballPredictionService");
 const wcHistory          = require("../services/wcHistoryLoader");
+const hlService          = require("../services/highlightlyService");
+const storage            = require("../services/highlightlyStorageService");
+const { normalizeFootballLineups } = require("../services/highlightlyNormalizer");
 const { getCache, setCache, TTL, KEYS } = require("../services/cacheService");
 
 // ── GET /api/football/matches ──────────────────────────────────────
@@ -146,6 +149,55 @@ async function getWCHistory(_req, res) {
   }
 }
 
+// ── GET /api/football/matches/:id/lineups ─────────────────────────
+// Fetches live from Highlightly API (available ~30min before KO).
+async function getMatchLineups(req, res) {
+  try {
+    const matchId  = req.params.id;
+    const cacheKey = `football:lineups:${matchId}`;
+    const cached   = getCache(cacheKey);
+    if (cached) return res.json({ lineups: cached });
+
+    const raw     = await hlService.getFootballLineups(matchId);
+    const lineups = normalizeFootballLineups(raw);
+    if (!lineups) return res.status(404).json({ error: "Lineups not yet available" });
+
+    setCache(cacheKey, lineups, 10); // 10-min cache — formation rarely changes
+    res.json({ lineups });
+  } catch (e) {
+    console.error("[Football] getMatchLineups:", e.message);
+    res.status(503).json({ error: "Lineups not yet available" });
+  }
+}
+
+// ── GET /api/football/matches/:id/events ──────────────────────────
+// Returns events (goals, cards, subs) stored in the fixture's data JSONB.
+async function getMatchEvents(req, res) {
+  try {
+    const matchId = req.params.id;
+    const match   = await footballService.getMatchById(matchId);
+    if (!match) return res.status(404).json({ error: "Match not found" });
+    res.json({ events: match.events || [] });
+  } catch (e) {
+    console.error("[Football] getMatchEvents:", e.message);
+    res.status(500).json({ error: "Failed to fetch match events" });
+  }
+}
+
+// ── GET /api/football/matches/:id/stats ───────────────────────────
+// Returns match statistics stored in the fixture's data JSONB.
+async function getMatchStats(req, res) {
+  try {
+    const matchId = req.params.id;
+    const match   = await footballService.getMatchById(matchId);
+    if (!match) return res.status(404).json({ error: "Match not found" });
+    res.json({ statistics: match.statistics || null });
+  } catch (e) {
+    console.error("[Football] getMatchStats:", e.message);
+    res.status(500).json({ error: "Failed to fetch match statistics" });
+  }
+}
+
 module.exports = {
   getMatches,
   getLive,
@@ -157,4 +209,7 @@ module.exports = {
   getGroups,
   getGroup,
   getWCHistory,
+  getMatchLineups,
+  getMatchEvents,
+  getMatchStats,
 };

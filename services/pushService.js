@@ -107,4 +107,39 @@ async function getTokensForUsers(userIds, preference) {
   return tokens?.map(r => r.token) ?? [];
 }
 
-module.exports = { sendPushNotifications, getTokensForPref, getTokensForUsers };
+/**
+ * Returns push tokens for a named broadcast segment.
+ * All segments still respect the user's admin_broadcasts preference.
+ *
+ * segment: 'all' | 'android' | 'ios' | 'active_7d'
+ */
+async function getTokensForSegment(segment = "all") {
+  if (segment === "android" || segment === "ios") {
+    const { data: prefs } = await supabase
+      .from("user_notification_preferences")
+      .select("user_id")
+      .eq("admin_broadcasts", true);
+    if (!prefs?.length) return [];
+    const userIds = prefs.map(p => p.user_id);
+    const { data: tokens } = await supabase
+      .from("push_tokens")
+      .select("token")
+      .in("user_id", userIds)
+      .eq("platform", segment);
+    return tokens?.map(r => r.token) ?? [];
+  }
+
+  if (segment === "active_7d") {
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+    const { data: activeUsers } = await supabase
+      .from("app_users")
+      .select("id")
+      .gte("last_active_at", weekAgo);
+    if (!activeUsers?.length) return [];
+    return getTokensForUsers(activeUsers.map(u => u.id), "admin_broadcasts");
+  }
+
+  return getTokensForPref("admin_broadcasts");
+}
+
+module.exports = { sendPushNotifications, getTokensForPref, getTokensForUsers, getTokensForSegment };

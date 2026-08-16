@@ -33,6 +33,7 @@ const adminDashboardService = require("../services/adminDashboardService");
 const accuracyService       = require("../services/accuracyService");
 const cloudinaryService    = require("../services/cloudinaryService");
 const { delCache, KEYS, listEntries } = require("../services/cacheService");
+const adminExternalService = require("../services/adminExternalService");
 
 const BANNER_LINK_TYPES = ["none", "external", "match", "tip", "league_home", "app_section"];
 
@@ -298,6 +299,7 @@ async function createBanner(req, res) {
     title, image_url, image_public_id,
     link_type = "none", link_value, link_meta,
     placements, display_order, is_active,
+    starts_at, ends_at,
   } = req.body;
 
   if (!title?.trim() || !image_url || !image_public_id) {
@@ -322,6 +324,8 @@ async function createBanner(req, res) {
       placements,
       display_order: Number(display_order) || 0,
       is_active: is_active ?? true,
+      starts_at: starts_at ?? null,
+      ends_at:   ends_at   ?? null,
     })
     .select()
     .single();
@@ -346,6 +350,7 @@ async function updateBanner(req, res) {
     title, image_url, image_public_id,
     link_type, link_value, link_meta,
     placements, display_order, is_active,
+    starts_at, ends_at,
   } = req.body;
 
   if (link_type && !BANNER_LINK_TYPES.includes(link_type)) {
@@ -372,6 +377,8 @@ async function updateBanner(req, res) {
   if (placements     !== undefined) updates.placements     = placements;
   if (display_order  !== undefined) updates.display_order  = Number(display_order) || 0;
   if (is_active      !== undefined) updates.is_active      = is_active;
+  if (starts_at      !== undefined) updates.starts_at      = starts_at ?? null;
+  if (ends_at        !== undefined) updates.ends_at        = ends_at   ?? null;
 
   const { data, error } = await supabase
     .from("banners")
@@ -635,31 +642,45 @@ async function reorderHomeSections(req, res) {
 
 async function listAccuracyAdmin(req, res) {
   try {
-    const all = [
-      { slug: "global", name: "Global (all leagues)" },
-      ...Object.values(LEAGUES).map(l => ({ slug: l.slug, name: l.name })),
-      ...Object.values(FOOTBALL_LEAGUES).map(l => ({ slug: l.slug, name: l.name })),
-      ...Object.values(intlService.INTERNATIONAL_LEAGUES).map(b => ({ slug: b.slug, name: b.name })),
+    // Football accuracy is not per-league — the service fetches all fixtures in one
+    // pool (no league filter). Compute it once and show as a single aggregate row.
+    const cricketSlugs = [
+      { slug: "global", name: "Global (all leagues)", group: "global" },
+      ...Object.values(LEAGUES).map(l => ({ slug: l.slug, name: l.name, group: "cricket" })),
+      ...Object.values(intlService.INTERNATIONAL_LEAGUES).map(b => ({ slug: b.slug, name: b.name, group: "cricket" })),
     ];
 
     const { data: overrides, error } = await supabase.from("accuracy_overrides").select("*");
     if (error) throw new Error(error.message);
     const overrideMap = new Map((overrides ?? []).map(o => [o.key, o.override_pct]));
 
-    const rows = await Promise.all(all.map(async ({ slug, name }) => {
+    // Cricket rows — each has a meaningful per-league computation
+    const cricketRows = await Promise.all(cricketSlugs.map(async ({ slug, name, group }) => {
       const computed = slug === "global"
         ? await accuracyService.computeGlobalAccuracy()
         : await accuracyService.computeLeagueAccuracy(slug);
       return {
-        slug,
-        name,
+        slug, name, group,
         computedPercentage: computed?.percentage ?? 0,
         sampleSize: computed?.total ?? 0,
         override: overrideMap.get(slug) ?? null,
       };
     }));
 
-    return res.json({ rows });
+    // Football — one aggregate row (per-league breakdown would be identical for every slug)
+    const footballComputed = await accuracyService.computeLeagueAccuracy(
+      Object.keys(FOOTBALL_LEAGUES)[0] ?? "premier_league"
+    );
+    const footballRow = {
+      slug: "football",
+      name: "Football (all leagues)",
+      group: "football",
+      computedPercentage: footballComputed?.percentage ?? 0,
+      sampleSize: footballComputed?.total ?? 0,
+      override: overrideMap.get("football") ?? null,
+    };
+
+    return res.json({ rows: [...cricketRows, footballRow] });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
@@ -757,26 +778,130 @@ async function reorderLeagueCards(req, res) {
 }
 
 async function sendPushBroadcast(req, res) {
-  const { title, body, data } = req.body;
+  const { title, body, data, segment = "all" } = req.body;
   if (!title?.trim() || !body?.trim()) {
     return res.status(400).json({ error: "title and body are required" });
   }
 
   try {
-    const { sendPushNotifications, getTokensForPref } = require("../services/pushService");
-    const tokens = await getTokensForPref("admin_broadcasts");
+    const { sendPushNotifications, getTokensForSegment } = require("../services/pushService");
+    const tokens = await getTokensForSegment(segment);
 
     sendPushNotifications(tokens, title.trim(), body.trim(), data ?? {})
       .catch(e => console.error("[Admin] push broadcast error:", e.message));
 
-    return res.json({ queued: tokens.length });
+    return res.json({ queued: tokens.length, segment });
   } catch (e) {
     console.error("[Admin] sendPushBroadcast error:", e.message);
     return res.status(500).json({ error: "Failed to send broadcast" });
   }
 }
 
+async function getPredictionAnalytics(req, res) {
+  try {
+    const since30d = new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString();
+
+    const [{ data: recent30d }, { data: allResolved }, { data: pollStats }] = await Promise.all([
+      supabase.from("user_match_predictions").select("created_at, result, sport").gte("created_at", since30d).order("created_at", { ascending: true }),
+      supabase.from("user_match_predictions").select("result").in("result", ["correct", "wrong"]),
+      supabase.from("match_prediction_stats").select("team_a_name, team_b_name, team_a_count, team_b_count, total, updated_at").order("total", { ascending: false }).limit(50),
+    ]);
+
+    // Daily breakdown (last 30 days)
+    const dailyMap = new Map();
+    for (const row of recent30d ?? []) {
+      const date = row.created_at.slice(0, 10);
+      if (!dailyMap.has(date)) dailyMap.set(date, { date, total: 0, cricket: 0, football: 0, correct: 0, wrong: 0 });
+      const d = dailyMap.get(date);
+      d.total++;
+      if (row.sport === "cricket") d.cricket++;
+      else if (row.sport === "football") d.football++;
+      if (row.result === "correct") d.correct++;
+      else if (row.result === "wrong") d.wrong++;
+    }
+    const daily = [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date));
+
+    // Team popularity from poll stats
+    const teamMap = new Map();
+    for (const ps of pollStats ?? []) {
+      if (ps.team_a_name) teamMap.set(ps.team_a_name, (teamMap.get(ps.team_a_name) ?? 0) + (ps.team_a_count ?? 0));
+      if (ps.team_b_name) teamMap.set(ps.team_b_name, (teamMap.get(ps.team_b_name) ?? 0) + (ps.team_b_count ?? 0));
+    }
+    const teamStats = [...teamMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([team, predictions]) => ({ team, predictions }));
+
+    // Overall accuracy (all-time)
+    const correct = (allResolved ?? []).filter(r => r.result === "correct").length;
+    const wrong   = (allResolved ?? []).filter(r => r.result === "wrong").length;
+
+    // Most contested matches (closest 50/50 split)
+    const recentMatches = (pollStats ?? [])
+      .filter(ps => (ps.total ?? 0) >= 5)
+      .map(ps => ({
+        team_a: ps.team_a_name, team_b: ps.team_b_name,
+        team_a_votes: ps.team_a_count ?? 0, team_b_votes: ps.team_b_count ?? 0,
+        total: ps.total ?? 0,
+        spread: ps.total > 0 ? Math.abs(50 - Math.round(((ps.team_a_count ?? 0) / ps.total) * 100)) : 50,
+        updated_at: ps.updated_at,
+      }))
+      .sort((a, b) => a.spread - b.spread)
+      .slice(0, 8);
+
+    return res.json({
+      daily,
+      teamStats,
+      overall: {
+        totalLast30d: (recent30d ?? []).length,
+        correct,
+        wrong,
+        accuracy: (correct + wrong) > 0 ? Math.round((correct / (correct + wrong)) * 100) : 0,
+      },
+      recentMatches,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function getUserDetail(req, res) {
+  const { id } = req.params;
+  try {
+    const [{ data: user }, { data: predictions }, { data: token }] = await Promise.all([
+      supabase.from("app_users").select("*").eq("id", id).maybeSingle(),
+      supabase.from("user_match_predictions")
+        .select("id, match_id, sport, team_a, team_b, predicted_winner, result, created_at")
+        .eq("user_id", id).order("created_at", { ascending: false }).limit(20),
+      supabase.from("push_tokens").select("token, platform").eq("user_id", id).maybeSingle(),
+    ]);
+    return res.json({ user: user ?? null, predictions: predictions ?? [], pushToken: token ?? null });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
+async function getLeaderboardAdmin(req, res) {
+  const period = req.query.period === "week" ? "week" : "all";
+  const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
+  try {
+    const userPredictionService = require("../services/userPredictionService");
+    const leaderboard = await userPredictionService.getLeaderboard(limit, period);
+    return res.json({ leaderboard, period });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+}
+
 const commentService = require("../services/commentService");
+
+async function getAnalytics(req, res) {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 30, 7), 90);
+    const data = await adminDashboardService.getAnalytics({ days });
+    return res.json(data);
+  } catch (e) {
+    console.error("[Admin] getAnalytics:", e.message);
+    return res.status(500).json({ error: e.message });
+  }
+}
 
 async function listCommentsAdmin(req, res) {
   try {
@@ -799,6 +924,17 @@ async function deleteCommentAdmin(req, res) {
   } catch (e) {
     console.error("[Admin] deleteCommentAdmin:", e.message);
     return res.status(500).json({ error: "Failed to delete comment" });
+  }
+}
+
+async function getExternalAnalytics(req, res) {
+  try {
+    const days = Math.min(90, Math.max(7, parseInt(req.query.days ?? '30', 10)));
+    const data = await adminExternalService.getAllExternal(days);
+    return res.json(data);
+  } catch (e) {
+    console.error("[Admin] getExternalAnalytics:", e.message);
+    return res.status(500).json({ error: e.message });
   }
 }
 
@@ -840,4 +976,9 @@ module.exports = {
   listCommentsAdmin,
   deleteCommentAdmin,
   sendPushBroadcast,
+  getPredictionAnalytics,
+  getUserDetail,
+  getLeaderboardAdmin,
+  getAnalytics,
+  getExternalAnalytics,
 };

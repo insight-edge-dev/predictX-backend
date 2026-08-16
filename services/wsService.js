@@ -1,41 +1,43 @@
 /**
- * wsService.js — WebSocket server for real-time live scores across all leagues.
+ * wsService.js — WebSocket server for real-time live scores.
  *
- * One Sportsmonks /livescores call per poll returns ALL live fixtures globally.
- * We group them by league season_id, normalize, and broadcast two message types:
+ * Data source: hl_fixtures table (kept fresh by highlightlySyncService every 60s).
  *
- *   { type: "leagues:live", ts, byLeague: { ipl: [...], bbl: [...], ... } }
+ * Broadcasts two message types on each poll:
+ *   { type: "leagues:live", ts, byLeague: { ipl: [...], bbl: [...], intl: [...], ... } }
  *   { type: "ipl:live",     ts, matches: [...] }   ← backward compat
  *
  * Adaptive polling:
- *   Any live match present  →  30 s
- *   No live matches         →  2 min  (catches match start quickly)
+ *   Any live match present  → 30 s
+ *   No live matches         → 60 s
  */
 
 const WebSocket = require("ws");
-const sm        = require("./sportmonksService");
+const storage   = require("./highlightlyStorageService");
+const { getLeagueByHLId } = require("../config/highlightlyConfig");
 const { LEAGUES } = require("../config/leaguesConfig");
-const { normalizeFixture } = require("./sportmonksNormalizer");
-const { delCache, KEYS }   = require("./cacheService");
-const supabase             = require("../config/supabase");
+const { delCache } = require("./cacheService");
+const supabase  = require("../config/supabase");
 
-const POLL_LIVE_MS   =  10_000;   // 10 s when a match is live
-const POLL_IDLE_MS   =  60_000;   // 60 s when nothing is live
-const PING_MS        =  20_000;
-const MAX_WS_CLIENTS =  200;      // hard cap — Supabase Realtime also has a 200-conn limit
-const MAX_PER_IP     =    5;      // max concurrent connections per IP
+const POLL_LIVE_MS   = 30_000;
+const POLL_IDLE_MS   = 60_000;
+const PING_MS        = 20_000;
+const MAX_WS_CLIENTS =   200;
+const MAX_PER_IP     =     5;
 
-let wss              = null;
-let pollTimer        = null;
-let pingTimer        = null;
-let lastIplPayload   = null;
+let wss                = null;
+let pollTimer          = null;
+let pingTimer          = null;
+let lastIplPayload     = null;
 let lastLeaguesPayload = null;
 
-// Track milestones already sent this session — key: `${matchId}:${slot}:w${threshold}`
 const _milestoneSent = new Map();
-
-// Per-IP connection counts for DoS protection
 const _ipConnections = new Map();
+
+// All known domestic league slugs — pre-init byLeague with empty arrays
+const LEAGUE_SLUGS = Object.keys(LEAGUES);
+
+// ── Milestone notifications ───────────────────────────────────
 
 function _extractWickets(scoreStr) {
   if (!scoreStr) return null;
@@ -51,7 +53,6 @@ async function _checkMilestones(byLeague) {
     for (const m of matches) {
       if (!m?.id) continue;
       const id = String(m.id);
-
       const w1 = _extractWickets(m.score1);
       const w2 = _extractWickets(m.score2);
 
@@ -61,12 +62,11 @@ async function _checkMilestones(byLeague) {
           const key = `${id}:${slot}:w${threshold}`;
           if (w >= threshold && !_milestoneSent.has(key)) {
             _milestoneSent.set(key, true);
-            const t1 = m.team1Short ?? m.team1?.name ?? "";
-            const t2 = m.team2Short ?? m.team2?.name ?? "";
-            const teams = t1 && t2 ? `${t1} vs ${t2}` : "Live match";
+            const t1 = m.team1?.shortName ?? m.team1?.name ?? "";
+            const t2 = m.team2?.shortName ?? m.team2?.name ?? "";
             queue.push({
               title: `${threshold} Wickets Down`,
-              body:  `${teams} — ${threshold} wickets have fallen!`,
+              body:  `${t1 && t2 ? `${t1} vs ${t2}` : "Live match"} — ${threshold} wickets have fallen!`,
               data:  { type: "live_score", matchId: id },
             });
           }
@@ -76,10 +76,8 @@ async function _checkMilestones(byLeague) {
   }
 
   if (!queue.length) return;
-
   const tokens = await pushSvc.getTokensForPref("live_score");
   if (!tokens.length) return;
-
   for (const notif of queue) {
     pushSvc.sendPushNotifications(tokens, notif.title, notif.body, notif.data);
   }
@@ -123,98 +121,63 @@ function heartbeat() {
 
 let _isLiveMode = false;
 
-// Build a season_id → league config lookup once (static, covers all domestic tournaments)
-const SEASON_TO_LEAGUE = {};
-for (const league of Object.values(LEAGUES)) {
-  SEASON_TO_LEAGUE[league.seasonId] = league;
-}
-const LEAGUE_SLUGS = Object.keys(LEAGUES);
-
-// International bilateral buckets — keyed by stable Sportsmonks league_id.
-// Using league_id (not season_id) so this works across season rollovers without code changes.
-const INTL_LEAGUE_ID_TO_SLUG = {
-  3:   "t20i",   // Twenty20 International (Men's)
-  258: "wt20i",  // Twenty20 International Women
-  261: "wodi",   // One Day International Women
-};
-const INTL_SLUGS = [...new Set(Object.values(INTL_LEAGUE_ID_TO_SLUG))];
-
 async function poll() {
   try {
-    const raw = await sm.getLivescores();
-    const liveFixtures = Array.isArray(raw) ? raw : [];
+    // Read today's fixtures from warehouse (kept fresh by syncTodayMatches every 60s)
+    const allToday = await storage.getTodayFixtures();
 
-    // Group normalized matches by league slug (domestic + international)
+    // Group by slug
     const byLeague = {};
-    for (const slug of LEAGUE_SLUGS)  byLeague[slug] = [];
-    for (const slug of INTL_SLUGS)    byLeague[slug] = [];
+    for (const slug of LEAGUE_SLUGS) byLeague[slug] = [];
+    byLeague["intl"] = []; // international bilateral matches
 
-    for (const fixture of liveFixtures) {
-      // Try domestic league first (season_id lookup), then international fallback (league_id)
-      const league    = SEASON_TO_LEAGUE[fixture.season_id];
-      const intlSlug  = !league ? INTL_LEAGUE_ID_TO_SLUG[fixture.league_id] : null;
-      const targetSlug = league?.slug ?? intlSlug;
-      if (!targetSlug) continue;
+    for (const fixture of allToday) {
+      if (fixture.status !== "live") continue;
 
-      const m = normalizeFixture(fixture);
-      if (!m) continue;
+      // Map HL leagueId → config slug
+      const conf       = fixture.leagueId ? getLeagueByHLId(String(fixture.leagueId)) : null;
+      const targetSlug = conf?.slug ?? "intl";
 
-      // If normalizer detected completion via statusText, persist result to
-      // Supabase (survives restarts) + bust fixtures cache.
-      if (m.status === "completed") {
-        // Evict milestone keys for this match — prevents the Map from growing unbounded
+      const m = {
+        ...fixture,
+        team1Short: fixture.team1?.shortName ?? "",
+        team2Short: fixture.team2?.shortName ?? "",
+      };
+
+      if (!byLeague[targetSlug]) byLeague[targetSlug] = [];
+      byLeague[targetSlug].push(m);
+
+      // If this match just completed — evict milestone keys
+      if (fixture.status === "completed") {
         for (const key of _milestoneSent.keys()) {
           if (key.startsWith(`${m.id}:`)) _milestoneSent.delete(key);
         }
-        if (league) {
-          // Domestic league: bust the cached fixture list and persist to Supabase
-          delCache(KEYS.LEAGUE_FIXTURES(league.slug));
-          const { setCache } = require("./cacheService");
-          setCache(`completed_match:${m.id}`, m, 24 * 60 * 60);
-          supabase.from("match_results").upsert({
-            match_id:    String(m.id),
-            league_slug: league.slug,
-            data:        m,
-          }, { onConflict: "match_id" }).then(() => {
-            console.log(`[WS] match ${m.id} result saved to Supabase`);
-            const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-            supabase.from("match_results").delete().lt("created_at", cutoff)
-              .then(({ count }) => { if (count) console.log(`[WS] cleaned ${count} old match_results rows`); })
-              .catch(() => {});
-          }).catch(e => console.error("[WS] Supabase upsert error:", e.message));
-        } else {
-          // International match: bust the bucket fixture cache so schedule picks it up
-          delCache(`intl:series:list:${intlSlug}`);
-          delCache("intl:schedule");
-          console.log(`[WS] intl match ${m.id} completed — busted ${intlSlug} cache`);
-        }
-        continue; // don't include in live payload
+        // Bust fixture cache
+        if (conf?.slug) delCache(`league:fixtures:${conf.slug}`);
+        // Persist result to Supabase match_results
+        supabase.from("match_results").upsert({
+          match_id:    String(m.id),
+          league_slug: conf?.slug ?? "intl",
+          data:        m,
+        }, { onConflict: "match_id" }).catch(e =>
+          console.warn("[WS] match_results upsert failed:", e.message)
+        );
       }
-
-      byLeague[targetSlug].push({
-        ...m,
-        status:     "live",
-        team1Short: m.team1?.shortName ?? "",
-        team2Short: m.team2?.shortName ?? "",
-      });
     }
 
-    const nowLive = Object.values(byLeague).some(arr => arr.length > 0);
+    const nowLive   = Object.values(byLeague).some(arr => arr.length > 0);
     const totalLive = Object.values(byLeague).reduce((s, a) => s + a.length, 0);
 
-    // ── Broadcast 1: unified multi-league payload ────────────
     const leaguesPayload = { type: "leagues:live", ts: Date.now(), byLeague };
     lastLeaguesPayload = leaguesPayload;
     broadcast(leaguesPayload);
 
-    // ── Broadcast 2: backward-compat ipl:live ────────────────
     const iplPayload = { type: "ipl:live", ts: Date.now(), matches: byLeague.ipl ?? [] };
     lastIplPayload = iplPayload;
     broadcast(iplPayload);
 
     console.log(`[WS] broadcast — totalLive=${totalLive} clients=${clientCount()}`);
 
-    // Check for wicket milestones and push to subscribed users
     if (nowLive) {
       _checkMilestones(byLeague).catch(e => console.warn("[WS] milestone push error:", e.message));
     }
@@ -267,7 +230,6 @@ function init(server) {
     ws.on("pong", () => { ws.isAlive = true; });
 
     safeSend(ws, JSON.stringify({ type: "ipl:hello", ts: Date.now() }));
-    // Send last-known payloads so the new client has data immediately
     if (lastLeaguesPayload) safeSend(ws, JSON.stringify(lastLeaguesPayload));
     if (lastIplPayload)     safeSend(ws, JSON.stringify(lastIplPayload));
 

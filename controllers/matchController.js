@@ -1,29 +1,117 @@
 /**
  * matchController.js — handlers for /api/matches/* routes.
  *
- * Data source: Sportsmonks (single API, no quota issues).
+ * Data source: Highlightly API + hl_fixtures / hl_scorecards warehouse.
  *
  * Cache tiers:
- *   NodeCache (hot) → Supabase DB (warm) → Sportsmonks API (cold)
- *
- * Match IDs are now Sportsmonks integer fixture IDs (e.g. 69518).
+ *   NodeCache (hot) → hl_scorecards Supabase (warm) → Highlightly API (cold)
  */
 
-const sm  = require("../services/sportmonksService");
+const hl  = require("../services/highlightlyService");
+const storage = require("../services/highlightlyStorageService");
+const hlSync  = require("../services/highlightlySyncService");
 const db  = require("../services/dbService");
 const {
   normalizeFixture,
   normalizeScorecard,
-  normalizeSquadPlayers,
-  normalizeLineup,
-  normalizeBalls,
-} = require("../services/sportmonksNormalizer");
+  normalizeFootballFixture,
+} = require("../services/highlightlyNormalizer");
 const {
   getIPLMatches,
   getIPLLiveMatches,
   getIPLFixtures,
 } = require("../services/iplService");
 const { getCache, setCache, TTL, KEYS } = require("../services/cacheService");
+const supabase = require("../config/supabase");
+
+// In-flight deduplication: concurrent requests for the same match ID share
+// one Highlightly call instead of firing N parallel requests → avoids 429s.
+const _fullFixtureInFlight = new Map();
+
+// Converts the internal normalizeScorecard shape → Innings[] expected by the frontend.
+// Internal: { innings: [{ inningIndex, team, batsmen[{playerId,...}], bowlers, extras:{total,wides,noBalls,...}, fallOfWickets }] }
+// Frontend: [{ inning, batsmen[{id,...}], bowlers[{id,...}], extras:{runs,nb,wd,lb,b}, total:{runs,wickets,overs}, yetToBat, fow }]
+function _toFrontendInnings(scorecard, match) {
+  const rawInnings = Array.isArray(scorecard) ? scorecard : (scorecard?.innings ?? []);
+  if (!rawInnings.length) return null;
+
+  function parseScore(s) {
+    if (!s) return null;
+    const m = String(s).match(/^(\d+)(?:\/(\d+))?/);
+    return m ? { runs: parseInt(m[1], 10), wickets: parseInt(m[2] ?? "10", 10) } : null;
+  }
+  function parseOvers(s) {
+    if (!s) return "";
+    return String(s).replace(/,?\s*T:\d+\s*ov/i, "").replace(/\s*ov.*/i, "").trim();
+  }
+
+  return rawInnings.map(inn => {
+    const team   = inn.team ?? {};
+    const teamId = String(team.id || "");
+
+    // Match this innings' team to the fixture's home/away scores by team ID.
+    let sc       = null;
+    let oversStr = "";
+    if (match) {
+      const isHome = teamId && teamId === String(match.team1?.id || "");
+      const isAway = teamId && teamId === String(match.team2?.id || "");
+      if (isHome) { sc = parseScore(match.score1); oversStr = parseOvers(match.overs1); }
+      else if (isAway) { sc = parseScore(match.score2); oversStr = parseOvers(match.overs2); }
+    }
+
+    const batsmen = (inn.batsmen || []).map(b => ({
+      id:         b.playerId || b.id || "",
+      name:       b.name     || "",
+      imageUrl:   b.imageUrl ?? null,
+      runs:       b.runs       ?? 0,
+      balls:      b.balls      ?? 0,
+      fours:      b.fours      ?? 0,
+      sixes:      b.sixes      ?? 0,
+      strikeRate: b.strikeRate ?? 0,
+      dismissal:  b.dismissalText || b.dismissal || "",
+      isNotOut:   b.dismissal === "not out" || b.isNotOut === true,
+      isCaptain:  b.isCaptain ?? false,
+      isKeeper:   b.isKeeper  ?? false,
+    }));
+
+    const bowlers = (inn.bowlers || []).map(b => ({
+      id:       b.playerId || b.id || "",
+      name:     b.name     || "",
+      imageUrl: b.imageUrl ?? null,
+      overs:    b.overs    ?? 0,
+      maidens:  b.maidens  ?? 0,
+      runs:     b.runs     ?? 0,
+      wickets:  b.wickets  ?? 0,
+      economy:  b.economy  ?? 0,
+    }));
+
+    const rawExtras = inn.extras ?? {};
+    const extras = {
+      runs: rawExtras.total   ?? rawExtras.runs ?? 0,
+      nb:   rawExtras.noBalls ?? rawExtras.nb   ?? 0,
+      wd:   rawExtras.wides   ?? rawExtras.wd   ?? 0,
+      lb:   rawExtras.legByes ?? rawExtras.lb   ?? 0,
+      b:    rawExtras.byes    ?? rawExtras.b    ?? 0,
+    };
+
+    const fow = (inn.fallOfWickets || inn.fow || []).map(f => ({
+      player: f.batsman || f.player || "",
+      runs:   f.runs ?? 0,
+      over:   String(f.over ?? f.overs ?? 0),
+    }));
+
+    const teamShort = team.shortName || team.abbreviation || team.name || "";
+    return {
+      inning:   `${teamShort} Innings`,
+      batsmen,
+      bowlers,
+      extras,
+      total:    sc ? { runs: sc.runs, wickets: sc.wickets, overs: oversStr } : null,
+      yetToBat: inn.yetToBat ?? [],
+      fow,
+    };
+  });
+}
 
 // ── GET /api/matches ──────────────────────────────────────────
 
@@ -69,10 +157,10 @@ async function getResults(req, res) {
 }
 
 // ── GET /api/matches/:id ──────────────────────────────────────
-// Lightweight match summary — from fixtures list (no extra API call).
+// Lightweight match summary — from hl_fixtures warehouse.
 
 async function getMatchById(req, res) {
-  const id = Number(req.params.id);
+  const id = String(req.params.id);
   if (!id) return res.status(400).json({ error: "Match id required" });
 
   const cacheKey = KEYS.MATCH_DETAIL(id);
@@ -81,21 +169,23 @@ async function getMatchById(req, res) {
     const mem = getCache(cacheKey);
     if (mem) return res.json(mem);
 
-    // 2. DB (completed matches only)
-    const fromDB = await db.getMatch(String(id));
-    if (fromDB) {
-      setCache(cacheKey, fromDB, TTL.MATCH_DETAIL);
-      return res.json(fromDB);
+    // 2. IPL fixtures list first (likely already cached)
+    const fixtures = await getIPLFixtures();
+    const match    = fixtures.find(m => String(m.id) === id);
+    if (match) {
+      setCache(cacheKey, match, match.status === "live" ? TTL.LIVE : TTL.MATCH_DETAIL);
+      return res.json(match);
     }
 
-    // 3. Fixtures list (cheap — already cached)
-    const fixtures = await getIPLFixtures();
-    const match    = fixtures.find(m => m.id === id);
-    if (!match) return res.status(404).json({ error: "Match not found" });
+    // 3. Warehouse for non-IPL matches (league matches stored by syncService)
+    const stored = await storage.getTodayFixtures(); // broad warehouse query fallback
+    const wMatch = stored.find(m => String(m.id) === id);
+    if (wMatch) {
+      setCache(cacheKey, wMatch, wMatch.status === "live" ? TTL.LIVE : TTL.MATCH_DETAIL);
+      return res.json(wMatch);
+    }
 
-    if (match.status === "completed") void db.saveMatch(String(id), match.status, match);
-    setCache(cacheKey, match, match.status === "live" ? TTL.LIVE : TTL.MATCH_DETAIL);
-    return res.json(match);
+    return res.status(404).json({ error: "Match not found" });
   } catch (e) {
     console.error(`[Match] getMatchById(${id}):`, e.message);
     return res.status(500).json({ error: "Failed to fetch match" });
@@ -103,111 +193,178 @@ async function getMatchById(req, res) {
 }
 
 // ── Internal: resolve full fixture detail ─────────────────────
-// NodeCache → DB → Sportsmonks API (with batting/bowling/scorecard).
+// NodeCache → hl_scorecards warehouse → Highlightly API.
 
 async function _resolveFullFixture(id) {
-  const cacheKey = KEYS.MATCH_FULL(id);
+  const sid = String(id);
+
+  // Deduplicate: if a request for this ID is already in-flight, wait for it.
+  if (_fullFixtureInFlight.has(sid)) {
+    return _fullFixtureInFlight.get(sid);
+  }
+  const promise = _doResolveFullFixture(sid);
+  _fullFixtureInFlight.set(sid, promise);
+  promise.finally(() => _fullFixtureInFlight.delete(sid));
+  return promise;
+}
+
+async function _doResolveFullFixture(sid) {
+  const cacheKey = KEYS.MATCH_FULL(sid);
 
   // 1. NodeCache
   const mem = getCache(cacheKey);
   if (mem) return { data: mem, fresh: false };
 
-  // 2. DB (completed matches)
-  const fromDB = await db.getMatch(String(id));
-  if (fromDB?.scorecard) {
-    setCache(cacheKey, fromDB, TTL.MATCH_DETAIL);
-    return { data: fromDB, fresh: false };
-  }
+  // 2. Check hl_fixtures to detect sport — football matches skip the cricket path
+  try {
+    const { data: row } = await supabase
+      .from("hl_fixtures")
+      .select("format, data")
+      .eq("id", sid)
+      .maybeSingle();
 
-  // 3. Sportsmonks — single call returns everything
-  const raw = await sm.getFixtureDetail(id);
-  if (!raw) {
-    // Fallback: return basic fixture data seeded by leagueService when it
-    // fetched the league fixtures list (covers new leagues with limited
-    // per-fixture coverage on Sportsmonks, e.g. GSL 2026 upcoming matches).
-    const basic = getCache(`match:basic:${id}`);
-    if (basic) return { data: basic, fresh: false };
-    return { data: null, fresh: false };
-  }
+    if (row?.format === "90min") {
+      // Football match — try to enrich with live detail, fall back to stored data
+      let full = row.data ?? null;
+      try {
+        const raw = await hl.getFootballMatchDetail(sid);
+        if (raw) {
+          const enriched = normalizeFootballFixture(raw);
+          if (enriched) full = enriched;
+        }
+      } catch {}
+      if (full) {
+        setCache(cacheKey, full, full.status === "live" ? TTL.LIVE : TTL.MATCH_DETAIL);
+        return { data: full, fresh: true };
+      }
+    }
+  } catch {}
 
-  const match     = normalizeFixture(raw);
-  if (!match) {
-    const basic = getCache(`match:basic:${id}`);
-    if (basic) return { data: basic, fresh: false };
-    return { data: null, fresh: false };
-  }
-
-  const scorecard = normalizeScorecard(raw);
-
-  // Squad from batting/bowling players (who actually played).
-  // For upcoming matches (no batting data yet), fetch full team squads from Sportsmonks.
-  let squad = _buildSquadFromFixture(raw, match);
-
-  if (match.status === "upcoming" && !squad.team1Players.length && !squad.team2Players.length) {
+  // 3. Warehouse scorecard (permanent store — set after first API call)
+  const storedSc = await storage.getScorecard(sid);
+  if (storedSc) {
+    // Look up fixture header from hl_fixtures (Highlightly IDs — works for all leagues).
+    // getIPLFixtures() uses Sportsmonks IDs which never match Highlightly match IDs.
+    let match = null;
     try {
-      const [sq1, sq2] = await Promise.all([
-        sm.getTeamSquad(raw.localteam_id),
-        sm.getTeamSquad(raw.visitorteam_id),
-      ]);
-      squad = {
-        team1: { name: match.team1.name, shortName: match.team1.shortName },
-        team2: { name: match.team2.name, shortName: match.team2.shortName },
-        team1Players: normalizeSquadPlayers(sq1 ?? []),
-        team2Players: normalizeSquadPlayers(sq2 ?? []),
-      };
+      const { data: fr } = await supabase
+        .from("hl_fixtures")
+        .select("data")
+        .eq("id", sid)
+        .maybeSingle();
+      if (fr?.data) match = fr.data;
+    } catch {}
+
+    if (match) {
+      const scorecard = _toFrontendInnings(storedSc, match);
+      const full = { ...match, scorecard, squad: _buildSquadFromScorecard(storedSc, match) };
+      setCache(cacheKey, full, TTL.MATCH_DETAIL);
+      return { data: full, fresh: false };
+    }
+  }
+
+  // 4. Highlightly API — fetch full cricket match detail
+  let raw = null;
+  try {
+    raw = await hl.getMatchDetail(sid);
+  } catch (e) {
+    console.warn(`[Match] hl.getMatchDetail(${sid}) failed:`, e.message);
+  }
+
+  if (!raw) {
+    // 4a. IPL list fallback
+    const fixtures = await getIPLFixtures();
+    const basic    = fixtures.find(m => String(m.id) === sid);
+    if (basic) return { data: basic, fresh: false };
+
+    // 4b. hl_fixtures warehouse fallback — covers non-IPL leagues (Sri Lanka, etc.)
+    // that are synced but not in the IPL list and whose detail Highlightly can't serve
+    try {
+      const { data: warehouseRow } = await supabase
+        .from("hl_fixtures")
+        .select("data")
+        .eq("id", sid)
+        .maybeSingle();
+      if (warehouseRow?.data) return { data: warehouseRow.data, fresh: false };
     } catch (e) {
-      console.warn("[Match] squad fetch for upcoming failed:", e.message);
+      console.warn(`[Match] warehouse fallback(${sid}) failed:`, e.message);
     }
+
+    return { data: null, fresh: false };
   }
 
-  const full = { ...match, scorecard, squad };
+  // normalizeFixture works on the match-detail object too (same shape as list items)
+  const match        = normalizeFixture(raw) ?? getCache(`match:basic:${sid}`) ?? null;
+  const scorecardRaw = normalizeScorecard(raw, sid);          // internal format (stored in warehouse)
+  const scorecard    = _toFrontendInnings(scorecardRaw, match); // Innings[] for the frontend
+  const squad        = scorecardRaw ? _buildSquadFromScorecard(scorecardRaw, match) : { team1Players: [], team2Players: [] };
 
-  // Persist completed matches indefinitely
-  if (match.status === "completed") {
-    void db.saveMatch(String(id), match.status, full);
-    if (squad?.team1Players?.length || squad?.team2Players?.length) {
-      void db.saveSquad(String(id), squad);
-    }
+  const full = { ...(match ?? {}), scorecard, squad };
+
+  // Persist scorecard permanently (store internal format so _toFrontendInnings can re-transform on cache miss)
+  if (scorecardRaw) {
+    void storage.storeScorecard(sid, scorecardRaw);
   }
 
-  const ttl = match.status === "live" ? TTL.LIVE : TTL.MATCH_DETAIL;
+  const ttl = match?.status === "live" ? TTL.LIVE : TTL.MATCH_DETAIL;
   setCache(cacheKey, full, ttl);
-
   return { data: full, fresh: true };
 }
 
-// Build squad from players who appeared in batting/bowling entries
-function _buildSquadFromFixture(raw, match) {
-  const batting  = Array.isArray(raw.batting)  ? raw.batting  : [];
-  const bowling  = Array.isArray(raw.bowling)  ? raw.bowling  : [];
-
-  const playerMap = {};
-  for (const b of batting)  { if (b.batsman) playerMap[b.player_id] = { ...b.batsman, team_id: b.team_id }; }
-  for (const b of bowling)  { if (b.bowler)  playerMap[b.player_id] = { ...b.bowler,  team_id: b.team_id }; }
-
-  const team1Players = [];
-  const team2Players = [];
-
-  for (const [, p] of Object.entries(playerMap)) {
-    const player = {
-      id:   String(p.id),
-      name: p.fullname || `${p.firstname || ""} ${p.lastname || ""}`.trim(),
-      role: p.position?.name || "",
-      battingStyle: p.battingstyle || "",
-      bowlingStyle: p.bowlingstyle || "",
-      image: p.image_path || "",
-      isCaptain: false,
-      isKeeper:  p.position?.name === "Wicketkeeper",
+// Build squad from scorecard innings (batsmen + bowlers who played)
+function _buildSquadFromScorecard(scorecard, match) {
+  if (!scorecard?.innings?.length) {
+    return {
+      team1: { name: match?.team1?.name ?? "", shortName: match?.team1?.shortName ?? "" },
+      team2: { name: match?.team2?.name ?? "", shortName: match?.team2?.shortName ?? "" },
+      team1Players: [], team2Players: [],
     };
-    if (p.team_id === raw.localteam_id)   team1Players.push(player);
-    else                                   team2Players.push(player);
+  }
+
+  const playerMap1 = new Map();
+  const playerMap2 = new Map();
+  const t1Name = match?.team1?.name ?? "";
+  const t2Name = match?.team2?.name ?? "";
+
+  for (const inn of scorecard.innings) {
+    const isT1 = inn.team?.name === t1Name || (inn.inningIndex === 1);
+    const targetMap = isT1 ? playerMap1 : playerMap2;
+
+    for (const b of (inn.batsmen || [])) {
+      if (!b.playerId) continue;
+      targetMap.set(b.playerId, {
+        id:           b.playerId,
+        name:         b.name,
+        role:         (b.roles?.[0] ?? ""),
+        battingStyle: b.battingStyle ?? "",
+        bowlingStyle: "",
+        image:        "",
+        isCaptain:    false,
+        isKeeper:     b.roles?.some(r => /keep/i.test(r)) ?? false,
+      });
+    }
+    for (const b of (inn.bowlers || [])) {
+      if (!b.playerId) continue;
+      const existing = targetMap.get(b.playerId);
+      if (existing) existing.bowlingStyle = b.bowlingStyle ?? "";
+      else targetMap.set(b.playerId, {
+        id:           b.playerId,
+        name:         b.name,
+        role:         "Bowler",
+        battingStyle: "",
+        bowlingStyle: b.bowlingStyle ?? "",
+        image:        "",
+        isCaptain:    false,
+        isKeeper:     false,
+      });
+    }
   }
 
   return {
-    team1: { name: match.team1.name, shortName: match.team1.shortName },
-    team2: { name: match.team2.name, shortName: match.team2.shortName },
-    team1Players,
-    team2Players,
+    team1: { name: t1Name, shortName: match?.team1?.shortName ?? "" },
+    team2: { name: t2Name, shortName: match?.team2?.shortName ?? "" },
+    team1Players: [...playerMap1.values()],
+    team2Players: [...playerMap2.values()],
   };
 }
 
@@ -269,9 +426,13 @@ async function getMatchSquad(req, res) {
       return res.json(fromDB);
     }
 
-    // 3. Get fixture info to find team IDs
+    // 3. Get fixture info — check IPL list first, then warehouse
     const fixtures = await getIPLFixtures();
-    const match    = fixtures.find(m => m.id === id);
+    let match = fixtures.find(m => String(m.id) === String(id));
+    if (!match) {
+      const all = await storage.getTodayFixtures();
+      match = all.find(m => String(m.id) === String(id)) ?? null;
+    }
     if (!match) return res.status(404).json({ error: "Match not found" });
 
     // For completed/live: extract from full fixture (plays actual players)
@@ -284,25 +445,15 @@ async function getMatchSquad(req, res) {
       }
     }
 
-    // For upcoming: fetch full season squads from both teams in parallel
-    const raw = await sm.getFixtureDetail(id);
-    if (!raw) return res.status(404).json({ error: "Squad not available" });
-
-    const [sq1, sq2] = await Promise.all([
-      sm.getTeamSquad(raw.localteam_id),
-      sm.getTeamSquad(raw.visitorteam_id),
-    ]);
-
-    const squad = {
-      team1: { name: match.team1.name, shortName: match.team1.shortName },
-      team2: { name: match.team2.name, shortName: match.team2.shortName },
-      team1Players: normalizeSquadPlayers(sq1 ?? []),
-      team2Players: normalizeSquadPlayers(sq2 ?? []),
+    // For upcoming: no squad data available from Highlightly yet
+    const emptySquad = {
+      team1: { name: match?.team1?.name ?? "", shortName: match?.team1?.shortName ?? "" },
+      team2: { name: match?.team2?.name ?? "", shortName: match?.team2?.shortName ?? "" },
+      team1Players: [],
+      team2Players: [],
     };
-
-    void db.saveSquad(String(id), squad);
-    setCache(cacheKey, squad, TTL.SQUADS);
-    return res.json(squad);
+    setCache(cacheKey, emptySquad, TTL.MATCH_DETAIL);
+    return res.json(emptySquad);
   } catch (e) {
     console.error(`[Match] getMatchSquad(${id}):`, e.message);
     return res.status(500).json({ team1Players: [], team2Players: [] });
@@ -339,6 +490,7 @@ async function getMatchStats(req, res) {
 }
 
 // ── GET /api/matches/:id/lineup ───────────────────────────────
+// Derive lineup from scorecard (players who batted/bowled in the match).
 
 async function getMatchLineup(req, res) {
   const { id } = req.params;
@@ -348,16 +500,14 @@ async function getMatchLineup(req, res) {
   if (mem) return res.json(mem);
 
   try {
-    const fixture = await sm.getFixtureDetail(id);
-    if (!fixture) return res.json({ team1XI: [], team2XI: [] });
+    const { data } = await _resolveFullFixture(id);
+    if (!data?.squad) return res.json({ team1XI: [], team2XI: [] });
 
-    const lineup = normalizeLineup(
-      fixture.lineup ?? [],
-      fixture.localteam_id,
-      fixture.visitorteam_id,
-    );
-
-    if (lineup.team1XI.length > 0 || lineup.team2XI.length > 0) {
+    const lineup = {
+      team1XI: data.squad.team1Players ?? [],
+      team2XI: data.squad.team2Players ?? [],
+    };
+    if (lineup.team1XI.length || lineup.team2XI.length) {
       setCache(cacheKey, lineup, TTL.DAILY);
     }
     return res.json(lineup);
@@ -368,35 +518,10 @@ async function getMatchLineup(req, res) {
 }
 
 // ── GET /api/matches/:id/overs ────────────────────────────────
+// Ball-by-ball data is not available from Highlightly — return empty.
 
 async function getMatchOvers(req, res) {
-  const { id } = req.params;
-  const cacheKey = `match:overs:${id}`;
-
-  const mem = getCache(cacheKey);
-  if (mem) return res.json(mem);
-
-  try {
-    const fixture = await sm.getMatchBalls(id);
-    if (!fixture) return res.json({ overs: [], currentOver: 0 });
-
-    // Pass fixture.balls raw — normalizeBalls handles both array and paginated {data:[]}
-    const overs = normalizeBalls(fixture.balls);
-    console.log(`[Overs] matchId=${id} fixture.balls type=${Array.isArray(fixture.balls) ? 'array' : typeof fixture.balls} balls=${Array.isArray(fixture.balls) ? fixture.balls.length : 'n/a'} overs=${overs.length}`);
-
-    const result = {
-      overs,
-      currentOver: overs.length > 0 ? overs[overs.length - 1].overNumber : 0,
-    };
-
-    // Live: cache 30s; completed: cache 6h
-    const isLive = fixture.live === true;
-    setCache(cacheKey, result, isLive ? TTL.LIVE : TTL.SERIES);
-    return res.json(result);
-  } catch (e) {
-    console.error("[Match] overs error:", e.message);
-    return res.json({ overs: [], currentOver: 0 });
-  }
+  return res.json({ overs: [], currentOver: 0 });
 }
 
 module.exports = {

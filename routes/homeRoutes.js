@@ -12,7 +12,6 @@
 
 const express  = require("express");
 const axios    = require("axios");
-const sm       = require("../services/sportmonksService");
 const { fetchCricketNews }  = require("../services/newsService");
 const { getCache, setCache, TTL } = require("../services/cacheService");
 const { getCachedData, setCachedData } = require("../services/dbService");
@@ -140,6 +139,7 @@ router.get("/home/rankings", async (_req, res) => {
     } else {
       console.warn("[Rankings] no data returned — not caching (will retry next request)");
     }
+    res.set("Cache-Control", "public, max-age=3600, stale-while-revalidate=86400");
     return res.json(result);
   } catch (e) {
     console.error("[Home] rankings error:", e.message);
@@ -200,111 +200,11 @@ router.get("/home/news/:id", async (req, res) => {
 });
 
 // ── GET /api/home/season-stats ────────────────────────────────
-// Aggregates Orange Cap / Purple Cap / Six Hitters from season fixtures.
-// Uses Sportsmonks /fixtures with batting.batsman + bowling.bowler includes.
-
-const SEASON_STATS_TTL_S  = 30 * 60;
-const SEASON_STATS_TTL_MS = SEASON_STATS_TTL_S * 1000;
-
-const COMPLETED_STATUSES = new Set(["Finished", "Completed", "Abandoned", "Rained Out", "No Result"]);
-
-function _isCompleted(f) {
-  return COMPLETED_STATUSES.has(f.status) || !!f.draw_noresult;
-}
-
-function _playerFullName(p) {
-  if (!p) return "";
-  return [p.firstname, p.lastname].filter(Boolean).join(" ");
-}
-
-function _aggregateBatting(fixtures) {
-  const map = new Map();
-  for (const f of fixtures) {
-    if (!_isCompleted(f) || !Array.isArray(f.batting)) continue;
-    for (const b of f.batting) {
-      if (!b.player_id || b.score == null) continue;
-      const pid  = String(b.player_id);
-      const name = _playerFullName(b.batsman);
-      if (!name) continue;
-      if (!map.has(pid)) {
-        const teamId = b.team_id;
-        const team   = f.localteam_id === teamId ? f.localteam : f.visitorteam;
-        map.set(pid, { playerId: pid, name, imageUrl: b.batsman?.image_path ?? null, teamShort: team?.code ?? "", teamName: team?.name ?? "", runs: 0, sixes: 0, fixtures: new Set() });
-      }
-      const p = map.get(pid);
-      p.runs  += Number(b.score)  || 0;
-      p.sixes += Number(b.six_x)  || 0;
-      p.fixtures.add(f.id);
-    }
-  }
-  return Array.from(map.values()).map(p => ({ ...p, matches: p.fixtures.size, fixtures: undefined }));
-}
-
-function _aggregateBowling(fixtures) {
-  const map = new Map();
-  for (const f of fixtures) {
-    if (!_isCompleted(f) || !Array.isArray(f.bowling)) continue;
-    for (const b of f.bowling) {
-      if (!b.player_id || b.wickets == null) continue;
-      const pid  = String(b.player_id);
-      const name = _playerFullName(b.bowler);
-      if (!name) continue;
-      if (!map.has(pid)) {
-        const teamId = b.team_id;
-        const team   = f.localteam_id === teamId ? f.localteam : f.visitorteam;
-        map.set(pid, { playerId: pid, name, imageUrl: b.bowler?.image_path ?? null, teamShort: team?.code ?? "", teamName: team?.name ?? "", wickets: 0, fixtures: new Set() });
-      }
-      const p = map.get(pid);
-      p.wickets += Number(b.wickets) || 0;
-      p.fixtures.add(f.id);
-    }
-  }
-  return Array.from(map.values()).map(p => ({ ...p, matches: p.fixtures.size, fixtures: undefined }));
-}
 
 router.get("/home/season-stats", async (_req, res) => {
-  const cacheKey = `home:season-stats:sm:${sm.IPL_SEASON_ID}`;
-  try {
-    const mem = getCache(cacheKey);
-    if (mem) return res.json(mem);
-
-    const dbHit = await getCachedData(cacheKey, SEASON_STATS_TTL_MS);
-    if (dbHit) {
-      setCache(cacheKey, dbHit, SEASON_STATS_TTL_S);
-      return res.json(dbHit);
-    }
-
-    const fixtures = await sm.getSeasonFixturesWithStats();
-    if (!Array.isArray(fixtures) || fixtures.length === 0) {
-      console.warn("[SeasonStats] No fixtures returned from Sportsmonks");
-      return res.json({ orangeCap: [], purpleCap: [], sixHitters: [] });
-    }
-
-    console.log(`[SeasonStats] Aggregating from ${fixtures.length} fixtures`);
-
-    const batting  = _aggregateBatting(fixtures);
-    const bowling  = _aggregateBowling(fixtures);
-
-    const result = {
-      orangeCap:  batting.sort((a, b) => b.runs - a.runs).slice(0, 8)
-        .map(p => ({ ...p, runs: p.runs, wickets: null, sixes: null })),
-      purpleCap:  bowling.sort((a, b) => b.wickets - a.wickets).slice(0, 8)
-        .map(p => ({ ...p, runs: null, sixes: null })),
-      sixHitters: [...batting].sort((a, b) => b.sixes - a.sixes).slice(0, 8)
-        .map(p => ({ ...p, runs: null, wickets: null, sixes: p.sixes })),
-    };
-
-    console.log(`[SeasonStats] orangeCap:${result.orangeCap.length} purpleCap:${result.purpleCap.length} sixHitters:${result.sixHitters.length}`);
-
-    if (result.orangeCap.length > 0 || result.purpleCap.length > 0) {
-      await setCachedData(cacheKey, result);
-      setCache(cacheKey, result, SEASON_STATS_TTL_S);
-    }
-    return res.json(result);
-  } catch (e) {
-    console.error("[Home] season-stats error:", e.message);
-    return res.status(500).json({ orangeCap: [], purpleCap: [], sixHitters: [] });
-  }
+  // Orange/Purple Cap from stored hl_scorecards (Sportsmonks no longer available).
+  // Aggregation from warehouse is a future enhancement; return empty for now.
+  return res.json({ orangeCap: [], purpleCap: [], sixHitters: [] });
 });
 
 // ── GET /api/img/news/:imageId ────────────────────────────────
@@ -415,17 +315,23 @@ router.get("/home/bundle", async (_req, res) => {
   if (cached) return res.json(cached);
 
   try {
-    const cricketLeagues = Object.values(LEAGUES);
+    // homeBundle: false → league appears in Matches picker but skips the home bundle
+    const cricketLeagues = Object.values(LEAGUES).filter(l => l.homeBundle !== false);
 
     const [cricketResults, football, intlSeries, intlSchedule, news] =
       await Promise.all([
-        // All cricket league match data in parallel
+        // All cricket league match data in parallel — 8s per-league timeout so one
+        // slow/absent league never blocks the whole bundle response.
         Promise.all(
-          cricketLeagues.map(l =>
-            leagueService.getLeagueMatches(l)
+          cricketLeagues.map(l => {
+            const timeout = new Promise(resolve =>
+              setTimeout(() => resolve({ slug: l.slug, live: [], upcoming: [], completed: [] }), 8_000)
+            );
+            const fetch = leagueService.getLeagueMatches(l)
               .then(d => ({ slug: l.slug, ...d }))
-              .catch(() => ({ slug: l.slug, live: [], upcoming: [], completed: [] }))
-          )
+              .catch(() => ({ slug: l.slug, live: [], upcoming: [], completed: [] }));
+            return Promise.race([fetch, timeout]);
+          })
         ),
         footballService.getMatches().catch(() => ({ live: [], upcoming: [], completed: [] })),
         internationalService.getSeriesList().catch(() => []),
@@ -444,7 +350,8 @@ router.get("/home/bundle", async (_req, res) => {
     // above) and causes getCachedDataByPrefix("pred:light:") to silently return an empty
     // Map, poisoning the 1h accuracy cache with zeros.
     const bundle = { matches, football, intlSeries, intlSchedule, leagueCards: [], news };
-    setCache(cacheKey, bundle, 30); // 30s — matches change frequently
+    setCache(cacheKey, bundle, 5 * 60); // 5 min — WS handles live scores; match status rarely changes faster
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=240");
     return res.json(bundle);
   } catch (e) {
     console.error("[Home] bundle error:", e.message);

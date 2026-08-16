@@ -13,10 +13,10 @@ const supabase = require("../config/supabase");
 const db = require("./dbService");
 const { getCache, setCache } = require("./cacheService");
 const { LEAGUES, FOOTBALL_LEAGUES } = require("../config/leaguesConfig");
+const { HL_CRICKET_LEAGUES } = require("../config/highlightlyConfig");
 const leagueService = require("./leagueService");
 const footballService = require("./footballService");
 const internationalService = require("./internationalService");
-const sm = require("./sportmonksService");
 const { getPersistentLightTip } = require("./lightTipService");
 
 const ACCURACY_TTL_S = 60 * 60; // 1h — match outcomes don't change retroactively
@@ -108,10 +108,10 @@ async function computeFootballTally(footballPredictions) {
   return tally(completed, footballPredictions, resolveFootballResult, "football:tip:");
 }
 
-async function computeInternationalBucketTally(bucket, cricketPredictions) {
-  const fixtures = await internationalService.getBucketFixtures(bucket);
-  const completed = fixtures.filter(m => internationalService.effectiveStatus(m) === "completed");
-  return tally(completed, cricketPredictions, resolveCricketResult, "pred:light:");
+async function computeInternationalBucketTally(_bucket, cricketPredictions) {
+  // INTERNATIONAL_LEAGUES is now empty; international matches are in hl_fixtures
+  // and counted through their respective league slugs. No-op for now.
+  return { correct: 0, total: 0 };
 }
 
 // ── Per-match row shaping (shared by the league-cards feature below) ──────
@@ -157,15 +157,25 @@ function sortByDateDesc(rows) {
 //   - an ongoing tournament: the next upcoming match (with our pick) + recent results
 
 async function getLeagueImageMap() {
+  // Build reverse map: Highlightly season ID → slug
+  const hlIdToSlug = new Map();
+  for (const [slug, cfg] of Object.entries(HL_CRICKET_LEAGUES)) {
+    for (const hlId of Object.values(cfg.seasons || {})) {
+      hlIdToSlug.set(String(hlId), slug);
+    }
+  }
+
   try {
-    const rawLeagues = await sm.getAllLeagues();
+    const { data } = await supabase.from("hl_leagues").select("id, logo");
     const map = new Map();
-    if (Array.isArray(rawLeagues)) {
-      for (const l of rawLeagues) map.set(l.id, l.image_path ?? "");
+    for (const l of (data || [])) {
+      if (!l.logo) continue;
+      const slug = hlIdToSlug.get(String(l.id));
+      if (slug) map.set(slug, l.logo);
     }
     return map;
   } catch (e) {
-    console.warn("[Accuracy] league cards: logo lookup failed:", e.message);
+    console.warn("[Accuracy] league image map failed:", e.message);
     return new Map();
   }
 }
@@ -249,17 +259,25 @@ async function computeLeagueCards(perLeagueLimit = 5) {
 
     Promise.all(Object.values(LEAGUES).filter(l => isCardVisible(l.slug)).map(async league => {
       try {
-        const { upcoming } = await leagueService.getLeagueMatches(league);
-        if (upcoming.length === 0) return null;
+        const { upcoming, completed } = await leagueService.getLeagueMatches(league);
 
         await ensureUpcomingPrediction(league.slug, upcoming[0], cricketPredictions, "pred:light:");
-        const upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(league.short));
+        const upcomingRow   = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(league.short));
+        const completedRows = buildRows(
+          sortByDateDesc(completed),
+          cricketPredictions, resolveCricketResult, "pred:light:", cricketRow(league.short),
+        );
+
+        const seasonOver = upcoming.length === 0;
+        const selectedRows = selectCardRows(seasonOver, null, upcomingRow, completedRows, perLeagueLimit);
+
+        if (selectedRows.length === 0) return null;
 
         return {
           slug: league.slug, name: league.name, season: league.season, flag: league.flag,
-          short: league.short, image: leagueImages.get(league.leagueId) || "", sport: "cricket",
+          short: league.short, image: leagueImages.get(league.slug) || "", sport: "cricket",
           accuracy: await getLeagueAccuracyPublic(league.slug),
-          recentMatches: upcomingRow ? [upcomingRow] : [],
+          recentMatches: selectedRows,
         };
       } catch (e) {
         console.warn(`[Accuracy] league cards: cricket ${league.slug} failed:`, e.message);
@@ -286,27 +304,10 @@ async function computeLeagueCards(perLeagueLimit = 5) {
       }
     })),
 
-    Promise.all(Object.values(internationalService.INTERNATIONAL_LEAGUES).filter(b => isCardVisible(b.slug)).map(async bucket => {
-      try {
-        const fixtures = await internationalService.getBucketFixtures(bucket);
-        const upcoming = fixtures
-          .filter(m => internationalService.effectiveStatus(m) === "upcoming")
-          .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-        if (upcoming.length === 0) return null;
-
-        const upcomingRow = buildUpcomingRow(upcoming[0], cricketPredictions, "pred:light:", cricketRow(bucket.short));
-
-        return {
-          slug: bucket.slug, name: bucket.name, season: "International", flag: bucket.flag,
-          short: bucket.short, image: leagueImages.get(bucket.leagueId) || "", sport: "cricket",
-          accuracy: await getLeagueAccuracyPublic(bucket.slug),
-          recentMatches: upcomingRow ? [upcomingRow] : [],
-        };
-      } catch (e) {
-        console.warn(`[Accuracy] league cards: international ${bucket.slug} failed:`, e.message);
-        return null;
-      }
-    })),
+    // International bilateral series — now uses hl_fixtures warehouse
+    // INTERNATIONAL_LEAGUES is empty (series are auto-discovered from hl_fixtures)
+    // so this block produces no cards; international series appear via their league slug
+    Promise.resolve([]),
 
   ]);
 

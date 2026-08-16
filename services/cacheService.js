@@ -10,7 +10,7 @@ const NodeCache = require("node-cache");
 // ── TTL constants (seconds) ───────────────────────────────────
 
 const TTL = {
-  LIVE:          30,           // live scores
+  LIVE:          90,           // live scores — matches shared hl:today cache TTL
   MATCH_DETAIL:  60,           // single match info
   FIXTURES:      10 * 60,      // upcoming fixtures
   RESULTS:       60 * 60,      // completed results

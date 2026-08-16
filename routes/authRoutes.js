@@ -120,7 +120,7 @@ router.post("/auth/send-otp", async (req, res) => {
     const expires = new Date(Date.now() + OTP_EXPIRY_MS).toISOString();
     const windowReset = !existing || (Date.now() - new Date(existing.window_start).getTime()) >= OTP_WINDOW_MS;
 
-    await supabase.from("otp_requests").upsert({
+    const { error: upsertErr } = await supabase.from("otp_requests").upsert({
       phone,
       otp_hash:     hash,
       attempts:     0,
@@ -130,6 +130,11 @@ router.post("/auth/send-otp", async (req, res) => {
       created_at:   new Date().toISOString(),
     }, { onConflict: "phone" });
 
+    if (upsertErr) {
+      console.error("[Auth] otp_requests upsert failed:", upsertErr.message, upsertErr.code);
+      return res.status(500).json({ error: "Could not save OTP. Please try again." });
+    }
+
     const maskedPhone = phone.slice(-4).padStart(phone.length, "*");
     if (!isDemo) {
       try {
@@ -137,6 +142,9 @@ router.post("/auth/send-otp", async (req, res) => {
         console.log(`[Auth] OTP sent to ${maskedPhone}`);
       } catch (smsErr) {
         console.error(`[Auth] SMS failed for ${maskedPhone}:`, smsErr.message);
+        // SMS failed after DB write — delete the saved OTP so the user isn't confused
+        await supabase.from("otp_requests").delete().eq("phone", phone);
+        return res.status(500).json({ error: "Failed to send SMS. Please try again." });
       }
     } else {
       console.log(`[Auth] OTP (demo) to ${maskedPhone}`);

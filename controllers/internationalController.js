@@ -54,6 +54,26 @@ async function getSeriesList(req, res) {
   }
 }
 
+// ── GET /api/international/all-series ─────────────────────────
+// Returns ALL cricket series from the warehouse (franchise + international).
+// Used by the "World Cricket" screen.
+
+async function getAllSeriesList(req, res) {
+  try {
+    const cacheKey = "all:cricket:series:ctrl";
+    const cached = getCache(cacheKey);
+    if (cached) return res.json(cached);
+
+    const series = await international.getAllCricketSeries();
+    const payload = { series };
+    setCache(cacheKey, payload, 5 * 60);
+    return res.json(payload);
+  } catch (e) {
+    console.error("[Intl] getAllSeriesList error:", e.message);
+    return res.status(500).json({ series: [] });
+  }
+}
+
 // ── GET /api/international/series/:stageId ────────────────────
 // Returns the series' matches, each carrying a lightweight prediction
 // (same { ...match, tip } shape the cricket matches screen already expects).
@@ -165,4 +185,4 @@ async function getMatchTip(req, res) {
   }
 }
 
-module.exports = { getSeriesList, getSeriesDetail, getSchedule, getMatchTip };
+module.exports = { getSeriesList, getAllSeriesList, getSeriesDetail, getSchedule, getMatchTip };

@@ -1,138 +1,257 @@
 /**
- * leagueService.js — Generic data layer for any Sportsmonks league.
+ * leagueService.js — Generic data layer for ALL leagues (Highlightly-powered).
  *
- * Accepts a league config object from leaguesConfig.js and provides
- * the same fixtures / live / matches / table interface that iplService
- * provides for IPL — but for any of the 26 supported leagues.
+ * This is the main service for every league the app supports: IPL, PSL, BBL,
+ * BPL, T20 Blast, T20 World Cup, ISL, La Liga, bilateral series, state leagues,
+ * and any other league added in future. It replaces the old Sportsmonks-backed
+ * implementation entirely.
  *
- * Cache strategy (per-league):
- *   Fixtures  — NodeCache 10 min + DB 6 h
- *   Standings — NodeCache 6 h   + DB 6 h
- *   Live      — NodeCache 30 s  (never DB)
+ * Called from controllers with a league config object from leaguesConfig.js.
+ * The slug is the bridge between leaguesConfig.js and highlightlyConfig.js.
+ *
+ * Cache strategy (warehouse-first, same as iplService):
+ *   NodeCache (10 min)
+ *   → hl_* Supabase tables (permanent warehouse — no TTL discard)
+ *   → Highlightly API (refreshes warehouse on fetch)
+ *   → stale warehouse data if API is unreachable
+ *
+ * Data is NEVER discarded from Supabase. The warehouse grows with every season.
  */
 
-const sm       = require("./sportmonksService");
-const db       = require("./dbService");
-const supabase = require("../config/supabase");
-const { normalizeFixture, normalizeStandings } = require("./sportmonksNormalizer");
-const { getCache, setCache, delCache, TTL, KEYS } = require("./cacheService");
+const hl      = require("./highlightlyService");
+const storage = require("./highlightlyStorageService");
+const sync    = require("./highlightlySyncService");
+const {
+  normalizeFixture,
+  normalizeFootballFixture,
+  normalizeLiveDetail,
+  normalizeStandings,
+} = require("./highlightlyNormalizer");
+const { getCache, setCache, delCache, TTL } = require("./cacheService");
+const {
+  HL_CRICKET_LEAGUES,
+  HL_FOOTBALL_LEAGUES,
+  getHLLeagueId,
+} = require("../config/highlightlyConfig");
 
-// ── Season discovery (for leagues not in hardcoded config) ────
+// Refresh from API if DB data is older than 6 hours
+const STALE_MS = 6 * 60 * 60_000;
 
-async function resolveSeasonId(league) {
-  if (league.seasonId) return Number(league.seasonId);
+// TTL for the shared "today's matches" cache — all leagues read from one API call.
+// syncTodayMatches seeds this key every 60s so individual league calls almost
+// always find a cache hit and make zero extra API requests.
+const TODAY_CACHE_TTL = 90; // seconds
 
-  const cacheKey = `league:season:${league.leagueId ?? league.slug}`;
-  const cached   = getCache(cacheKey);
-  if (cached) return cached;
+async function _getTodayRaw(sport) {
+  const key = `hl:today:${sport}`;
+  const mem = getCache(key);
+  if (mem) return mem;
 
-  console.log(`[League:${league.slug}] discovering season for league ${league.leagueId}`);
-  const seasons = await sm.getRecentSeasons?.();  // may not exist in older build
-  if (!Array.isArray(seasons)) return null;
+  const today = new Date().toISOString().split("T")[0];
+  try {
+    const raw = sport === "football"
+      ? await hl.getFootballMatches({ date: today })
+      : await hl.getMatches({ date: today });
+    const arr = Array.isArray(raw) ? raw : (raw?.data ?? []);
+    setCache(key, arr, TODAY_CACHE_TTL);
+    return arr;
+  } catch (e) {
+    console.warn(`[League] _getTodayRaw(${sport}) failed:`, e.message);
+    return [];
+  }
+}
 
-  const match = seasons.find(s => s.league_id === league.leagueId);
-  if (!match) return null;
+// ── League ID resolution ──────────────────────────────────────
+// Maps a leaguesConfig.js league object → Highlightly leagueId string.
+// Returns null if the slug isn't registered in highlightlyConfig.js yet.
 
-  setCache(cacheKey, match.id, TTL.DAILY);
-  console.log(`[League:${league.slug}] found season ${match.id} (${match.year})`);
-  return match.id;
+function _resolveHLId(league) {
+  const season = Number(league.season) || new Date().getFullYear();
+
+  // Auto-discovered league: slug = "hl_<leagueId>" — extract the ID directly
+  if (league.slug.startsWith("hl_")) {
+    return league.slug.replace("hl_", "");
+  }
+
+  // Cricket leagues
+  const hlCricket = HL_CRICKET_LEAGUES[league.slug];
+  if (hlCricket) {
+    // Fall back to currentSeason if the specified season doesn't exist
+    return hlCricket.seasons[season] ?? hlCricket.seasons[hlCricket.currentSeason] ?? null;
+  }
+
+  // Football leagues
+  const hlFootball = HL_FOOTBALL_LEAGUES[league.slug];
+  if (hlFootball) {
+    return hlFootball.id ?? null;
+  }
+
+  // Try to find by slug variation (e.g. 'wc2026' → 'wc')
+  const wcSlug = Object.keys(HL_FOOTBALL_LEAGUES).find(s => league.slug.startsWith(s));
+  if (wcSlug) return HL_FOOTBALL_LEAGUES[wcSlug].id ?? null;
+
+  return null;
+}
+
+function _isFootball(league) {
+  return league.sport === "football";
 }
 
 // ── Fixtures ──────────────────────────────────────────────────
 
+// In-flight dedup: concurrent requests for the same league share one DB/API call.
+const _inflightFixtures = {};
+
 async function getLeagueFixtures(league) {
-  const memKey = `league:fixtures:${league.slug}`;
-  const dbKey  = `league:fixtures:${league.slug}:${league.season}`;
+  const currentYear = new Date().getFullYear();
+  const season = Number(league.season) || currentYear;
+  const memKey = `league:fixtures:${league.slug}:${season}`;
 
-  const mem = getCache(memKey);
-  if (mem) {
-    console.log(`[League:${league.slug}] CACHE HIT — fixtures (memory)`);
-    return mem;
-  }
-
-  const dbHit = await db.getCachedData(dbKey, 6 * 60 * 60_000);
-  if (dbHit) {
-    console.log(`[League:${league.slug}] CACHE HIT — fixtures (DB)`);
-    setCache(memKey, dbHit, TTL.FIXTURES);
-    return dbHit;
-  }
-
-  const seasonId = await resolveSeasonId(league);
-  if (!seasonId) { console.warn(`[League:${league.slug}] no seasonId`); return []; }
-
-  console.log(`[League:${league.slug}] FETCH — fixtures from Sportsmonks`);
-  const raw = await sm.getFixturesBySeasonId(seasonId);
-  if (!raw || !Array.isArray(raw)) {
-    console.warn(`[League:${league.slug}] no fixtures from API`);
-    return [];
-  }
-
-  const fixtures = raw
-    .map(f => normalizeFixture(f))
-    .filter(Boolean)
-    .sort((a, b) => new Date(a.date) - new Date(b.date));
-
-  console.log(`[League:${league.slug}] fixtures: ${fixtures.length} matches`);
-  setCache(memKey, fixtures, TTL.FIXTURES);
-  // Seed per-fixture fallback cache — match-detail falls back to this when
-  // Sportsmonks /fixtures/:id returns null (e.g. new leagues with limited coverage).
-  fixtures.forEach(m => {
-    if (m.id && !getCache(`match:basic:${m.id}`)) {
-      setCache(`match:basic:${m.id}`, m, TTL.FIXTURES);
-    }
-  });
-  void db.setCachedData(dbKey, fixtures);
-  void db.syncCricketReferenceData(fixtures);
-  return fixtures;
-}
-
-// ── Live matches ──────────────────────────────────────────────
-// Filters the global /livescores feed by this league's season_id.
-
-async function getLeagueLiveMatches(league) {
-  const memKey = `league:live:${league.slug}`;
+  // 1. NodeCache
   const mem = getCache(memKey);
   if (mem) return mem;
 
-  const seasonId = await resolveSeasonId(league);
-  const raw = await sm.getLivescores();
-  if (!Array.isArray(raw)) return [];
+  // 2. In-flight dedup — concurrent requests share one DB/API call
+  if (_inflightFixtures[memKey]) return _inflightFixtures[memKey];
 
-  // 12 h is the absolute ceiling for any cricket format (inc. rain-delayed ODIs).
-  // If Sportsmonks' livescores feed keeps returning a match beyond this window
-  // it means their feed is stale — don't propagate the error to the app.
-  const MAX_LIVE_MS = 12 * 60 * 60 * 1000;
+  _inflightFixtures[memKey] = _doGetLeagueFixtures(league, season, memKey, currentYear)
+    .finally(() => { delete _inflightFixtures[memKey]; });
 
-  const live = raw
-    .filter(f => {
-      if (!seasonId || f.season_id !== seasonId) return false;
-      if (f.starting_at) {
-        const age = Date.now() - new Date(f.starting_at).getTime();
-        if (age > MAX_LIVE_MS) {
-          console.warn(`[League] dropping stale livescores entry for fixture ${f.id} (started ${Math.round(age / 3600000)}h ago)`);
-          return false;
-        }
-      }
-      return true;
-    })
-    .map(f => normalizeFixture(f))
-    .filter(Boolean)
-    .map(m => ({
-      ...m,
-      status: "live",
-      // normalizeFixture sets statusText to "Match starts at <time>" only when
-      // it computed status as "upcoming" — but this fixture is from Sportsmonks'
-      // own /livescores feed, so it's actually in progress and that raw status
-      // was simply lagging. Don't let the now-false "Match starts at" text
-      // leak through once we know better; let the UI's own live fallback show.
-      statusText: /^Match starts at/.test(m.statusText) ? "" : m.statusText,
-    }));
-
-  setCache(memKey, live, TTL.LIVE);
-  return live;
+  return _inflightFixtures[memKey];
 }
 
-// ── Matches (live + upcoming + completed) ─────────────────────
+async function _doGetLeagueFixtures(league, season, memKey, currentYear) {
+  const hlId = _resolveHLId(league);
+  if (!hlId) return [];
+
+  // ── Past season: serve directly from warehouse without date-window limits ──
+  // For seasons older than the current year, the ±180-day window in
+  // getFixturesByWindow would miss them. Use season-scoped queries instead.
+  // Past seasons are immutable so we skip the API refresh step.
+  if (season < currentYear) {
+    const stored = _isFootball(league)
+      ? await storage.getFixturesByFootballSeason(hlId, season)
+      : await storage.getFixturesBySeason(hlId);
+
+    if (stored.count > 0) {
+      const enriched = _isFootball(league) ? stored.fixtures : await storage.enrichFixturesWithLogos(stored.fixtures);
+      // Past seasons don't change — cache for 24h
+      setCache(memKey, enriched, 24 * 3600);
+      return enriched;
+    }
+
+    console.warn(`[League:${league.slug}:${season}] No warehouse data for past season`);
+    setCache(memKey, [], 6 * 3600);
+    return [];
+  }
+
+  // ── Current / future season: existing date-window approach ──
+
+  // 2. Warehouse DB — date window (±180 d) so cross-season data is included
+  const { fixtures, updatedAt, count } = await storage.getFixturesByWindow(hlId);
+  const ageMs = updatedAt ? Date.now() - new Date(updatedAt).getTime() : Infinity;
+
+  if (count > 0 && ageMs < STALE_MS) {
+    const enriched = _isFootball(league) ? fixtures : await storage.enrichFixturesWithLogos(fixtures);
+    setCache(memKey, enriched, TTL.FIXTURES);
+    return enriched;
+  }
+
+  // 3. Highlightly API → refresh warehouse
+  console.log(`[League:${league.slug}] fetching from Highlightly API`);
+  try {
+    const raw = _isFootball(league)
+      ? await hl.getFootballMatches({ leagueId: hlId, season })
+      : await hl.getMatches({ leagueId: hlId, season, limit: 100 });
+
+    if (raw?.length) {
+      const normFn     = _isFootball(league) ? normalizeFootballFixture : normalizeFixture;
+      const normalized = raw.map(normFn).filter(Boolean)
+        .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+      void storage.storeFixtures(normalized);
+      void storage.storeTeams(
+        normalized.flatMap(f => [f.team1, f.team2]).filter(t => t?.id)
+          .map(t => ({ ...t, sport: league.sport || "cricket" }))
+      );
+
+      const enriched = _isFootball(league) ? normalized : await storage.enrichFixturesWithLogos(normalized);
+      setCache(memKey, enriched, TTL.FIXTURES);
+      console.log(`[League:${league.slug}] API → ${normalized.length} fixtures stored`);
+      return enriched;
+    }
+  } catch (e) {
+    console.warn(`[League:${league.slug}] API error:`, e.message);
+  }
+
+  // 4. Serve stale warehouse data (never empty the app)
+  if (count > 0) {
+    console.warn(`[League:${league.slug}] serving stale warehouse (${count} fixtures, ${Math.round(ageMs / 3_600_000)}h old)`);
+    const enriched = _isFootball(league) ? fixtures : await storage.enrichFixturesWithLogos(fixtures);
+    setCache(memKey, enriched, TTL.FIXTURES);
+    return enriched;
+  }
+
+  // Short TTL so the app recovers quickly once the API quota resets (midnight UTC).
+  setCache(memKey, [], 2 * 60);
+  return [];
+}
+
+// ── Live matches ──────────────────────────────────────────────
+
+async function getLeagueLiveMatches(league) {
+  const memKey = `league:live:${league.slug}`;
+  const mem    = getCache(memKey);
+  if (mem) return mem;
+
+  const hlId = _resolveHLId(league);
+  if (!hlId) return [];
+
+  try {
+    // Use shared today-cache — all leagues share one API call instead of firing
+    // one per league (which was 15 identical requests every 30 s).
+    const raw = await _getTodayRaw(_isFootball(league) ? "football" : "cricket");
+
+    const liveRaw = (raw || []).filter(m =>
+      String(m.league?.id) === String(hlId) &&
+      (m.state?.description === "In play" ||
+       m.state?.description === "HT" ||
+       (m.status && /live|in play/i.test(m.status)))
+    );
+
+    // Enrich with live batting detail
+    const normFn = _isFootball(league) ? normalizeFootballFixture : normalizeFixture;
+    const live = await Promise.all(
+      liveRaw.map(async m => {
+        const fixture = normFn(m);
+        if (!fixture) return null;
+        if (!_isFootball(league)) {
+          try {
+            const detail = await hl.getMatchDetail(m.id);
+            return detail ? normalizeLiveDetail(detail, fixture) : fixture;
+          } catch {
+            return fixture;
+          }
+        }
+        return fixture;
+      })
+    );
+
+    const result = live.filter(Boolean).map(m => ({ ...m, status: "live" }));
+    setCache(memKey, result, TTL.LIVE);
+    return result;
+  } catch (e) {
+    console.warn(`[League:${league.slug}] live matches error:`, e.message);
+    return [];
+  }
+}
+
+// ── Combined matches (live + upcoming + completed) ────────────
+
+// Detects a finished match whose sync cycle hasn't flipped status to 'completed' yet.
+// Patterns: "X won by Y runs/wickets", "tied", "abandoned", "no result".
+const RESULT_RE = /\b(won by|tied|abandoned|no result|match drawn)\b/i;
+function _isResultText(txt) { return typeof txt === "string" && RESULT_RE.test(txt); }
 
 async function getLeagueMatches(league) {
   const [fixtures, live] = await Promise.all([
@@ -140,173 +259,134 @@ async function getLeagueMatches(league) {
     getLeagueLiveMatches(league),
   ]);
 
-  const liveIds           = new Set(live.map(m => m.id));
-  const liveList          = [...live];
-  const upcoming          = [];
-  const seen              = new Set();
-  const STARTED_BUFFER_MS = 4 * 60 * 60 * 1000; // 4 hours
+  // Partition the live list: some "live" matches have already finished but
+  // the sync cycle hasn't promoted them to 'completed' yet. Detect this via
+  // the statusText and move them to completed immediately.
+  const trulyLive = [];
+  const justFinished = [];
+  for (const m of live) {
+    if (_isResultText(m.statusText)) {
+      justFinished.push({ ...m, status: "completed" });
+    } else {
+      trulyLive.push(m);
+    }
+  }
 
-  // ── Pass 1: categorise fixtures ──────────────────────────────
-  // Collect completed fixtures first so we can bulk-fetch their results
-  // from Supabase in ONE query instead of N individual queries.
-
-  const completedFixtures = []; // { match, startedInPast }
+  const liveIds   = new Set(trulyLive.map(m => m.id));
+  const finIds    = new Set(justFinished.map(m => m.id));
+  const liveArr   = [...trulyLive];
+  const upcoming  = [];
+  const completed = [...justFinished];
+  const seen      = new Set();
+  // Matches whose date is >6h in the past and still "upcoming" in the warehouse
+  // are treated as completed — handles seasons that ended without a live sync.
+  const pastCutoffMs = Date.now() - 6 * 60 * 60_000;
 
   for (const m of fixtures) {
     if (seen.has(m.id)) continue;
     seen.add(m.id);
-    if (liveIds.has(m.id)) continue;
+    if (liveIds.has(m.id) || finIds.has(m.id)) continue;
 
-    const startedInPast   = m.date && (Date.now() - new Date(m.date).getTime()) > STARTED_BUFFER_MS;
-    const hasStoredResult = !!getCache(`completed_match:${m.id}`);
-    const effectiveStatus =
-      (hasStoredResult || (startedInPast && m.status !== "completed"))
-        ? "completed"
-        : m.status;
-
-    if (effectiveStatus === "live") {
-      liveList.push(m);
-    } else if (effectiveStatus === "completed") {
-      completedFixtures.push({ match: m, startedInPast });
+    if (m.status === "live") {
+      if (_isResultText(m.statusText)) {
+        completed.push({ ...m, status: "completed" });
+      } else {
+        liveArr.push(m);
+      }
+    } else if (m.status === "completed") {
+      completed.push(m);
     } else {
-      upcoming.push(m);
+      const matchMs = m.date ? new Date(m.date).getTime() : 0;
+      if (matchMs && matchMs < pastCutoffMs) completed.push(m);
+      else                                   upcoming.push(m);
     }
   }
-
-  // ── Pass 2: bulk-load missing results (1 query, not N) ───────
-  // Only fetch for matches not already in NodeCache.
-
-  const needResults = completedFixtures.filter(({ match: m }) => !getCache(`completed_match:${m.id}`));
-
-  if (needResults.length > 0) {
-    try {
-      const ids = needResults.map(({ match: m }) => String(m.id));
-      const { data: rows } = await supabase
-        .from("match_results")
-        .select("match_id, data")
-        .in("match_id", ids);
-
-      const resultsMap = new Map((rows ?? []).map(r => [r.match_id, r.data]));
-
-      for (const { match: m } of needResults) {
-        const result = resultsMap.get(String(m.id));
-        if (result) {
-          setCache(`completed_match:${m.id}`, { ...result, status: "completed", isCompleted: true }, 24 * 60 * 60);
-          console.log(`[League] match ${m.id} result loaded from Supabase (bulk)`);
-        }
-      }
-
-      // Background: for matches still missing, try Sportsmonks (fire-and-forget)
-      for (const { match: m, startedInPast } of needResults) {
-        if (resultsMap.has(String(m.id))) continue;
-        if (!startedInPast || m.score1) continue;
-        const lockKey = `loading_result:${m.id}`;
-        if (getCache(lockKey)) continue;
-        setCache(lockKey, true, 300); // 5 min lock to avoid hammering Sportsmonks
-        sm.getFixtureDetail(m.id).then(detail => {
-          if (!detail) return;
-          const updated = normalizeFixture(detail);
-          if (updated?.score1) {
-            setCache(`completed_match:${m.id}`, { ...updated, status: "completed", isCompleted: true }, 24 * 60 * 60);
-            delCache(KEYS.LEAGUE_FIXTURES(league.slug));
-          }
-        }).catch(() => {});
-      }
-    } catch (e) {
-      console.warn(`[League:${league.slug}] bulk match_results fetch failed:`, e.message);
-    }
-  }
-
-  // ── Pass 3: build completed list with fresh NodeCache ────────
-  const completed = completedFixtures.map(({ match: m }) => {
-    const cached = getCache(`completed_match:${m.id}`);
-    return cached ?? { ...m, status: "completed", isCompleted: true };
-  });
 
   upcoming.sort((a, b)  => new Date(a.date) - new Date(b.date));
   completed.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-  console.log(`[League:${league.slug}] matches — live=${liveList.length} upcoming=${upcoming.length} completed=${completed.length}`);
-  return { live: liveList, upcoming, completed };
-}
-
-// ── Stage discovery (for leagues not in hardcoded config) ─────
-
-async function resolveStageId(league) {
-  if (league.stageId) return { stageId: league.stageId, playoffId: league.playoffId };
-
-  const stageKey = `league:stages:${league.slug}`;
-  const cached   = getCache(stageKey);
-  if (cached) return cached;
-
-  console.log(`[League:${league.slug}] discovering stages for season ${league.seasonId}`);
-  const stages = await sm.getSeasonStages(league.seasonId);
-  if (!Array.isArray(stages) || stages.length === 0) return { stageId: null, playoffId: null };
-
-  // Pick the first group/regular stage and first knockout stage
-  const regular  = stages.find(s => /group|regular|league/i.test(s.name ?? "")) ?? stages[0];
-  const knockout = stages.find(s => /knock|play.?off|final|elim/i.test(s.name ?? "") && s.id !== regular?.id) ?? null;
-
-  const result = { stageId: regular?.id ?? null, playoffId: knockout?.id ?? null };
-  setCache(stageKey, result, TTL.DAILY);
-  console.log(`[League:${league.slug}] stages: regular=${result.stageId} playoff=${result.playoffId}`);
-  return result;
+  return { live: liveArr, upcoming, completed };
 }
 
 // ── Points table ──────────────────────────────────────────────
 
 async function getLeagueTable(league) {
-  const memKey = `league:table:${league.slug}`;
-  const dbKey  = `league:table:${league.slug}:${league.season}`;
+  const season = Number(league.season) || new Date().getFullYear();
+  const memKey = `league:table:${league.slug}:${season}`;
 
   const mem = getCache(memKey);
-  if (mem) {
-    console.log(`[League:${league.slug}] CACHE HIT — table (memory)`);
-    return mem;
-  }
+  if (mem) return mem;
 
-  const dbHit = await db.getCachedData(dbKey, 6 * 60 * 60_000);
-  if (dbHit) {
-    console.log(`[League:${league.slug}] CACHE HIT — table (DB)`);
-    setCache(memKey, dbHit, TTL.POINTS_TABLE);
-    return dbHit;
-  }
-
-  // Discover stage IDs if not in config
-  const { stageId, playoffId } = await resolveStageId(league);
-  if (!stageId) {
-    console.warn(`[League:${league.slug}] no stageId — cannot fetch standings`);
+  const hlId = _resolveHLId(league);
+  if (!hlId) {
+    console.warn(`[League:${league.slug}] no Highlightly leagueId — cannot fetch standings`);
     return [];
   }
 
-  console.log(`[League:${league.slug}] FETCH — standings from Sportsmonks`);
-  const { regular } = await sm.getStandingsByStageIds(stageId, playoffId);
-  const table = normalizeStandings(regular);
+  // Warehouse
+  const { standings, updatedAt } = await storage.getStandings(hlId, season);
+  const ageMs = updatedAt ? Date.now() - new Date(updatedAt).getTime() : Infinity;
 
-  if (table.length > 0) {
-    setCache(memKey, table, TTL.POINTS_TABLE);
-    void db.setCachedData(dbKey, table);
-    console.log(`[League:${league.slug}] table: ${table.length} teams`);
+  if (standings?.length && ageMs < STALE_MS) {
+    setCache(memKey, standings, TTL.POINTS_TABLE);
+    return standings;
   }
-  return table;
+
+  // API via sync
+  const fresh = await sync.syncStandings(hlId, season);
+  if (fresh.length) {
+    setCache(memKey, fresh, TTL.POINTS_TABLE);
+    return fresh;
+  }
+
+  // Stale fallback
+  if (standings?.length) {
+    console.warn(`[League:${league.slug}] serving stale standings`);
+    setCache(memKey, standings, TTL.POINTS_TABLE);
+    return standings;
+  }
+
+  return [];
 }
 
 // ── Cache reset ───────────────────────────────────────────────
 
 async function resetLeagueCache(league) {
-  const memKeys = [
-    `league:fixtures:${league.slug}`,
-    `league:table:${league.slug}`,
-    `league:live:${league.slug}`,
-  ];
-  const { delCache } = require("./cacheService");
-  for (const k of memKeys) delCache(k);
+  delCache(`league:fixtures:${league.slug}`);
+  delCache(`league:table:${league.slug}`);
+  delCache(`league:live:${league.slug}`);
+  // Warehouse data is preserved — only NodeCache entries cleared
+  console.log(`[League:${league.slug}] NodeCache cleared (warehouse preserved)`);
+}
 
-  await Promise.all([
-    db.deleteFixtures(`league:fixtures:${league.slug}:${league.season}`),
-    db.deleteFixtures(`league:table:${league.slug}:${league.season}`),
-  ]);
-  console.log(`[League:${league.slug}] cache reset`);
+// ── Teams ─────────────────────────────────────────────────────
+
+async function getLeagueTeams(league) {
+  const memKey = `league:teams:${league.slug}`;
+  const mem    = getCache(memKey);
+  if (mem) return mem;
+
+  const hlId = _resolveHLId(league);
+  if (!hlId) return [];
+
+  const teams = await storage.getTeamsByLeague(hlId);
+  setCache(memKey, teams, TTL.POINTS_TABLE);
+  return teams;
+}
+
+// ── Highlights ────────────────────────────────────────────────
+
+async function getLeagueHighlights(league) {
+  const memKey = `league:highlights:${league.slug}`;
+  const mem    = getCache(memKey);
+  if (mem) return mem;
+
+  const hlId = _resolveHLId(league);
+  if (!hlId) return [];
+
+  const highlights = await storage.getLeagueHighlights(hlId, 20);
+  setCache(memKey, highlights, TTL.HIGHLIGHTS ?? 30 * 60);
+  return highlights;
 }
 
 module.exports = {
@@ -314,5 +394,7 @@ module.exports = {
   getLeagueLiveMatches,
   getLeagueMatches,
   getLeagueTable,
+  getLeagueTeams,
+  getLeagueHighlights,
   resetLeagueCache,
 };
