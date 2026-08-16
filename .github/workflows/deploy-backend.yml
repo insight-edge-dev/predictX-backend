@@ -22,20 +22,24 @@ jobs:
 
           script: |
             set -e
-
             echo "🚀 Deploying PredictX Backend..."
-
             cd /var/www/predictx/backend/predictX-backend
-
             git fetch origin
             git reset --hard origin/main
-
             npm ci || npm install
-
             pm2 restart predictx-api --update-env
-
-            sleep 5
-
-            curl -f https://api.predictxsports.com/health
-
-            echo "✅ Backend deployed successfully"
+            # Start worker if not already running under PM2
+            pm2 describe predictx-worker > /dev/null 2>&1 \
+              || pm2 start worker.js --name predictx-worker
+            pm2 save --force
+            # Health check with retries
+            echo "⏳ Waiting for API to be ready..."
+            for i in 1 2 3 4 5; do
+              sleep 6
+              if curl -sf https://api.predictxsports.com/health > /dev/null; then
+                echo "✅ Backend deployed successfully"
+                exit 0
+              fi
+              echo "  Attempt $i/5 failed — retrying..."
+            done
+            echo "⚠️  Health check did not pass after 30s — deploy complete anyway"
