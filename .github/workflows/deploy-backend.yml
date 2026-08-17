@@ -37,7 +37,7 @@ jobs:
             # Stop PM2 worker first, then force-kill any rogues with SIGKILL
             # (SIGTERM in a loop can propagate to the SSH session — SIGKILL cannot)
             pm2 stop predictx-worker 2>/dev/null || true
-            pkill -9 -f "worker\.js" 2>/dev/null || true
+            pkill -9 -f "node.*worker\.js" 2>/dev/null || true
             sleep 2
 
             # Restart worker under PM2 (picks up new code)
