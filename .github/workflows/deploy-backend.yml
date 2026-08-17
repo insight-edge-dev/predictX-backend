@@ -34,19 +34,13 @@ jobs:
 
             pm2 restart predictx-api --update-env
 
-            # Kill only worker.js processes that are NOT the PM2-managed worker
-            PM2_WORKER_PID="$(pm2 pid predictx-worker 2>/dev/null | head -n1 | tr -d ' ')"
-
-            for pid in $(pgrep -f "node .*/worker.js" || true); do
-              if [ -z "$PM2_WORKER_PID" ] || [ "$pid" != "$PM2_WORKER_PID" ]; then
-                echo "Killing rogue worker PID: $pid"
-                kill "$pid" 2>/dev/null || true
-              fi
-            done
-
+            # Stop PM2 worker first, then force-kill any rogues with SIGKILL
+            # (SIGTERM in a loop can propagate to the SSH session — SIGKILL cannot)
+            pm2 stop predictx-worker 2>/dev/null || true
+            pkill -9 -f "worker\.js" 2>/dev/null || true
             sleep 2
 
-            # Always restart worker to pick up new code
+            # Restart worker under PM2 (picks up new code)
             pm2 restart predictx-worker --update-env 2>/dev/null \
               || pm2 start worker.js --name predictx-worker
 
