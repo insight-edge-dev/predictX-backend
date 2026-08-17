@@ -22,27 +22,48 @@ jobs:
 
           script: |
             set -e
+
             echo "🚀 Deploying PredictX Backend..."
+
             cd /var/www/predictx/backend/predictX-backend
+
             git fetch origin
             git reset --hard origin/main
+
             npm ci || npm install
+
             pm2 restart predictx-api --update-env
-            # Kill any rogue worker.js processes not managed by PM2
-            pkill -f "node worker.js" 2>/dev/null || true
+
+            # Kill only worker.js processes that are NOT the PM2-managed worker
+            PM2_WORKER_PID="$(pm2 pid predictx-worker 2>/dev/null | head -n1 | tr -d ' ')"
+
+            for pid in $(pgrep -f "node .*/worker.js" || true); do
+              if [ -z "$PM2_WORKER_PID" ] || [ "$pid" != "$PM2_WORKER_PID" ]; then
+                echo "Killing rogue worker PID: $pid"
+                kill "$pid" 2>/dev/null || true
+              fi
+            done
+
             sleep 2
-            # Always restart worker (picks up new code); start on first deploy
+
+            # Always restart worker to pick up new code
             pm2 restart predictx-worker --update-env 2>/dev/null \
               || pm2 start worker.js --name predictx-worker
+
             pm2 save --force
-            # Health check with retries
+
             echo "⏳ Waiting for API to be ready..."
+
             for i in 1 2 3 4 5; do
               sleep 6
-              if curl -sf https://api.predictxsports.com/health > /dev/null; then
+
+              if curl -fsS https://api.predictxsports.com/health > /dev/null; then
                 echo "✅ Backend deployed successfully"
                 exit 0
               fi
+
               echo "  Attempt $i/5 failed — retrying..."
             done
-            echo "⚠️  Health check did not pass after 30s — deploy complete anyway"
+
+            echo "❌ Backend health check failed after 30s"
+            exit 1
