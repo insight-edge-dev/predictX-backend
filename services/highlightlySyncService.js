@@ -895,27 +895,43 @@ let _weeklyTimeout  = null;
  * Prevents the boot sequence from hammering a recovering Postgres instance.
  * Returns once a SELECT succeeds or the timeout elapses.
  */
-async function _waitForDb(maxWaitMs = 5 * 60_000) {
+async function _waitForDb(maxWaitMs = 10 * 60_000) {
   const start   = Date.now();
-  let   backoff = 5_000; // 5s → 7.5s → 11s … capped at 60s
+  let   backoff = 10_000; // 10s → 15s → 22s … capped at 60s
+
   while (Date.now() - start < maxWaitMs) {
     try {
-      const { error } = await supabase
+      // Probe with a WRITE, not a read — NANO Postgres can briefly accept SELECTs
+      // during recovery while still OOMing on writes. Confirming write capability
+      // prevents the thundering-herd re-crash we saw in prod logs.
+      const { error: e1 } = await supabase
         .from("worker_heartbeat")
-        .select("id")
-        .limit(1)
-        .single();
-      if (!error || error.code === "PGRST116") { // PGRST116 = no rows (table exists, DB healthy)
-        console.log("[HL Sync] DB healthy — starting sync jobs");
-        return;
+        .upsert({ id: 1, last_seen: new Date().toISOString(), worker_pid: process.pid });
+
+      if (!e1) {
+        // One success isn't proof of stability — the DB may be oscillating.
+        // Wait 20s and probe again; only proceed if both pass.
+        console.log("[HL Sync] DB write probe 1/2 passed — confirming in 20s…");
+        await _delay(20_000);
+
+        const { error: e2 } = await supabase
+          .from("worker_heartbeat")
+          .upsert({ id: 1, last_seen: new Date().toISOString(), worker_pid: process.pid });
+
+        if (!e2) {
+          console.log("[HL Sync] DB stable (2/2 write probes passed) — starting sync jobs");
+          return;
+        }
+        console.log("[HL Sync] DB unstable after probe 2 — restarting wait");
       }
     } catch {}
+
     const elapsed = Math.round((Date.now() - start) / 1000);
     console.log(`[HL Sync] DB not ready (${elapsed}s elapsed) — retrying in ${backoff / 1000}s`);
     await _delay(backoff);
     backoff = Math.min(Math.round(backoff * 1.5), 60_000);
   }
-  console.warn("[HL Sync] DB still not responding after 5 min — proceeding anyway");
+  console.warn("[HL Sync] DB still not responding after 10 min — proceeding anyway");
 }
 
 function start() {
@@ -926,10 +942,9 @@ function start() {
     // Without this, a recovering Postgres gets saturated the moment the
     // worker restarts, keeping it in a 522-timeout loop indefinitely.
     await _waitForDb();
-    // Extra settling time: _waitForDb passes on the first successful SELECT,
-    // but Postgres may still be warming up its connection pool. 30s here lets
-    // it stabilise before any write-heavy sync job fires.
-    await _delay(30_000);
+    // Extra settling time after the double write-probe: gives Postgres another
+    // 60s to finish recycling its connection pool before any bulk sync fires.
+    await _delay(60_000);
 
     // ── Recurring jobs ────────────────────────────────────────
 
