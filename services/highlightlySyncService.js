@@ -18,6 +18,7 @@ const hl      = require("./highlightlyService");
 const storage = require("./highlightlyStorageService");
 const { withSyncLog } = require("./syncLogger");
 const { delCache, setCache } = require("./cacheService");
+const { dbWriteQueue } = require("./dbWriteQueue");
 const {
   normalizeFixture,
   normalizeFootballFixture,
@@ -38,6 +39,30 @@ const FRANCHISE_IDS = new Set(
   Object.values(HL_CRICKET_LEAGUES)
     .flatMap(l => Object.values(l.seasons).map(String))
 );
+
+// ── Heavy-job mutex ───────────────────────────────────────────
+// Only one "heavy" sync (daily fixture refresh, football sync, historical sync)
+// may run at a time. Prevents daily + weekly jobs overlapping and doubling
+// the write load on the NANO Postgres connection pool.
+
+let _heavySyncRunning = false;
+
+async function _withHeavySync(name, fn) {
+  if (dbWriteQueue.isCircuitOpen) {
+    console.log(`[HL Sync] ${name}: circuit open — DB recovering, skipping`);
+    return;
+  }
+  if (_heavySyncRunning) {
+    console.log(`[HL Sync] ${name}: heavy sync already running — skipping`);
+    return;
+  }
+  _heavySyncRunning = true;
+  try {
+    await fn();
+  } finally {
+    _heavySyncRunning = false;
+  }
+}
 
 // Per-league cooldown for auto-discovered leagues — prevents re-syncing on every 60s poll
 const _newLeagueLastSynced = new Map(); // leagueId → timestamp
@@ -111,6 +136,7 @@ function _isMatchHour() {
  * Also enriches live matches with batting/bowling detail.
  */
 async function syncTodayMatches() {
+  if (dbWriteQueue.isCircuitOpen) return; // DB recovering — skip this poll, try next minute
   const today = new Date().toISOString().split("T")[0];
   try {
     const raw = await hl.getMatches({ date: today });
@@ -345,15 +371,21 @@ async function syncLeagueFixtures(slug, season) {
  * Refresh fixtures for every active league. Runs daily.
  */
 async function syncAllActiveLeagues() {
-  const active = getAllActiveLeagues();
-  console.log(`[HL Sync] daily refresh: ${active.length} active leagues`);
-  let total = 0;
-  for (const league of active) {
-    const fixtures = await syncLeagueFixtures(league.slug, league.currentSeason);
-    total += fixtures.length;
-    await _delay(3000); // 3s between leagues — was 600ms, prevents concurrent DB load on NANO
-  }
-  return { count: total };
+  return _withHeavySync("syncAllActiveLeagues", async () => {
+    const active = getAllActiveLeagues();
+    console.log(`[HL Sync] daily refresh: ${active.length} active leagues`);
+    let total = 0;
+    for (const league of active) {
+      if (dbWriteQueue.isCircuitOpen) {
+        console.warn("[HL Sync] syncAllActiveLeagues: circuit open — aborting batch");
+        break;
+      }
+      const fixtures = await syncLeagueFixtures(league.slug, league.currentSeason);
+      total += fixtures.length;
+      await _delay(3000);
+    }
+    return { count: total };
+  });
 }
 
 // ── Team logos ────────────────────────────────────────────────
@@ -527,16 +559,22 @@ async function syncAllSeasonsForLeague(slug) {
  * and weekly thereafter.  Rate-limited: 2 s between leagues.
  */
 async function syncAllHistoricalLeagues() {
-  const slugs = Object.keys(HL_CRICKET_LEAGUES);
-  console.log(`[HL Sync] historical sync starting — ${slugs.length} leagues`);
-  let total = 0;
-  for (const slug of slugs) {
-    const n = await syncAllSeasonsForLeague(slug);
-    total += (n || 0);
-    await _delay(2_000);
-  }
-  console.log("[HL Sync] historical sync complete");
-  return { count: total };
+  return _withHeavySync("syncAllHistoricalLeagues", async () => {
+    const slugs = Object.keys(HL_CRICKET_LEAGUES);
+    console.log(`[HL Sync] historical sync starting — ${slugs.length} leagues`);
+    let total = 0;
+    for (const slug of slugs) {
+      if (dbWriteQueue.isCircuitOpen) {
+        console.warn("[HL Sync] syncAllHistoricalLeagues: circuit open — aborting");
+        break;
+      }
+      const n = await syncAllSeasonsForLeague(slug);
+      total += (n || 0);
+      await _delay(2_000);
+    }
+    console.log("[HL Sync] historical sync complete");
+    return { count: total };
+  });
 }
 
 /**
@@ -716,9 +754,14 @@ async function syncFootballLeague(slug, season) {
  * Called daily and once at boot.
  */
 async function syncAllFootball() {
+  return _withHeavySync("syncAllFootball", async () => {
   const slugs = Object.keys(HL_FOOTBALL_LEAGUES);
   console.log(`[HL Sync] football sync: ${slugs.length} leagues`);
   for (const slug of slugs) {
+    if (dbWriteQueue.isCircuitOpen) {
+      console.warn("[HL Sync] syncAllFootball: circuit open — aborting batch");
+      break;
+    }
     const hlLeague = HL_FOOTBALL_LEAGUES[slug];
     const season   = hlLeague.currentSeason;
 
@@ -748,6 +791,7 @@ async function syncAllFootball() {
 
   // Sync highlight clips for all football leagues
   await syncAllFootballHighlights().catch(() => {});
+  }); // end _withHeavySync
 }
 
 /**

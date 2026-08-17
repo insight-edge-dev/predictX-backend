@@ -17,9 +17,9 @@
  *   void storeFixtures(data);   // queued but not awaited — response is immediate
  */
 
-const WRITE_SPACING_MS           = 200; // gap between consecutive Supabase calls
+const WRITE_SPACING_MS           = 200;  // gap between consecutive Supabase calls
 const CIRCUIT_FAIL_THRESHOLD     = 3;
-const CIRCUIT_COOLDOWN_MS        = 2 * 60_000; // 2 min pause after 3 consecutive failures
+const CIRCUIT_COOLDOWN_MS        = 10 * 60_000; // 10 min — NANO Postgres needs ~5-10 min to recover from OOM
 
 class PriorityWriteQueue {
   constructor() {

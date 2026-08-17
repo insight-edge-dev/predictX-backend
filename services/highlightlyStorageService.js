@@ -35,7 +35,10 @@ const NOW = () => new Date().toISOString();
 async function _upsert(table, rows, conflict = "id") {
   if (!rows?.length) return;
   const { error } = await supabase.from(table).upsert(rows, { onConflict: conflict });
-  if (error) console.error(`[HL Storage] ${table} upsert failed:`, error.message);
+  if (error) {
+    console.error(`[HL Storage] ${table} upsert failed:`, error.message);
+    throw error; // propagate so dbWriteQueue can count failures and trip the circuit breaker
+  }
 }
 
 // ── Fixtures ──────────────────────────────────────────────────
